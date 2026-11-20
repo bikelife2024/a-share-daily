@@ -257,6 +257,7 @@ def fetch_sector_boards():
     by = {}
     for r in (j.get("data") or {}).get("diff") or []:
         by[r.get("f14")] = num(r.get("f3"))
+    print("      板块接口返回 %d 个：%s" % (len(by), "、".join(list(by)[:10])))
     out = []
     for name in SECTORS:
         alias = SECTOR_ALIAS.get(name, name)
@@ -372,12 +373,14 @@ def fetch_kline(secid, limit=140):
 
 
 def fetch_holdings():
+    if not HOLDINGS:
+        return []
     secids = ",".join(s for s, _, _ in HOLDINGS)
     url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
            f"&secids={secids}&fields=f2,f3,f6,f8,f10,f12,f14")
     j = get_json(url)
     by_code = {}
-    for row in j["data"]["diff"]:
+    for row in (j.get("data") or {}).get("diff") or []:
         by_code[row.get("f12")] = row
     out = []
     for _, code, name in HOLDINGS:
