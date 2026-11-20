@@ -93,6 +93,7 @@ SECTORS = [
 SECTOR_ALIAS = {
     "IT服务Ⅱ": "IT服务", "军工电子Ⅱ": "军工电子", "航空装备Ⅱ": "航空装备",
     "银行Ⅱ": "银行", "证券Ⅱ": "证券", "保险Ⅱ": "保险", "白酒Ⅱ": "白酒",
+    "煤炭开采": "煤炭行业",
 }
 
 
@@ -779,7 +780,7 @@ def render(data):
     for s in sectors:
         rows_sec += (f'<tr><td>{s["name"]}</td>'
                      f'<td class="{cls(s["pct"])}">{spct(s["pct"])}</td>'
-                     f'<td>{s["n"]}</td></tr>')
+                     f'<td>{s["n"] or "—"}</td></tr>')
 
     # —— 海外行
     rows_os = ""
@@ -1142,41 +1143,26 @@ def main():
         print(f"· 休市（最新交易日 {last_date}，今天 {today}），跳过")
         return 0
 
-    # 全 A（行业市值加权的原料）；数据不够就降级，不让整份报告失败
-    rows_a, total_a, fail_pages = fetch_all_a()
-    cover = (len(rows_a) / total_a) if total_a else 0
-    print(f"[3/8] 全 A {len(rows_a)} / {total_a}（覆盖 {cover*100:.0f}%，失败 {fail_pages} 页）")
-    enough = len(rows_a) >= 3000 and cover >= 0.70
-
-    if enough:
-        up, dn, flat = compute_breadth(rows_a)
-        breadth_src = "全A自算"
+    # 涨跌家数：上证 / 深证综指 / 北证50 的成分统计，一次请求拿三市合计
+    fast = fetch_breadth_fast()
+    if fast:
+        up, dn, flat = fast
+        breadth_src = "三市指数成分统计"
     else:
-        fast = fetch_breadth_fast()
-        if fast:
-            up, dn, flat = fast
-            breadth_src = "指数成分统计"
-        elif rows_a:
-            up, dn, flat = compute_breadth(rows_a)
-            breadth_src = "全A自算（数据不全）"
-        else:
-            print("✗ 拿不到涨跌家数，退出")
-            return 2
+        print("✗ 拿不到涨跌家数，退出")
+        return 2
     print(f"      上涨 {up} 下跌 {dn} 平 {flat}（{breadth_src}）")
 
-    # 板块
-    if enough:
-        sectors = pick_sectors(compute_sectors(rows_a))
-        sector_src = ("总市值加权" if cover >= 0.99
-                      else "总市值加权·样本 %.0f%%" % (cover * 100))
-    else:
-        print("      全A 数据不足，板块降级为东财板块指数")
-        sectors = fetch_sector_boards()
-        sector_src = "板块指数（算术平均）"
+    # 板块：用东财行业板块指数（单次请求）。
+    # 注意口径——这是板块指数本身，板块内个股等权，不是总市值加权。
+    # 之前那版是拉全 A 逐只加权，但东财对云端 IP 的分页请求限制极严
+    # （实测每轮只能成功 3 页左右，60 页拿不完），所以换成板块指数。
+    sectors = fetch_sector_boards()
     if not sectors:
         print("✗ 拿不到板块数据，退出")
         return 2
-    print(f"[4/8] 板块 {len(sectors)} 个（{sector_src}）："
+    sector_src = "东财行业板块指数（板块内等权）"
+    print(f"[4/8] 板块 {len(sectors)} 个："
           f"{sectors[0]['name']} {sectors[0]['pct']}% … {sectors[-1]['name']} {sectors[-1]['pct']}%")
 
     # 涨跌停
