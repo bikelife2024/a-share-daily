@@ -151,45 +151,70 @@ def fetch_indices():
 def fetch_all_a():
     """全 A 股（含北交所），用于行业市值加权。
 
-    东方财富对 clist 的单页条数有限制（pz 明显超过 100 会直接断连），
-    而在跨境链路上单请求又很慢，逐页串行会拖到十几分钟。
-    所以改成小批量并发：每批 8 页同时发，批与批之间留间隔。
-    单页失败记下来，由调用方判断数据是否够用、要不要降级。
+    东方财富这边的限制比想象中严：单页条数超过约 100 会直接断连，
+    同一 IP 并发稍高就回 502。所以策略是——
+      1) 先探第一页拿到总数，算出要翻几页；
+      2) 并发压到 2，每轮之间留间隔；
+      3) 第一轮没收齐的页，第二轮串行慢慢补。
+    仍然收不齐就交给调用方降级，不让整份报告失败。
     """
     base = ("https://push2.eastmoney.com/api/qt/clist/get?pn={pn}&pz=100&po=1&np=1"
             "&fltt=2&invt=2&fid=f12"
             "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
             "&fields=f12,f14,f3,f20,f100")
 
-    def one(pn):
+    def one(pn, tries=2, timeout=12):
         try:
-            j = get_json(base.format(pn=pn), tries=2, timeout=15)
+            j = get_json(base.format(pn=pn), tries=tries, timeout=timeout)
             d = j.get("data") or {}
             return pn, (d.get("diff") or []), d.get("total")
         except Exception:  # noqa: BLE001
             return pn, None, None
 
-    allrows, total, failed = [], None, []
-    for start in range(1, 75, 8):
-        batch = list(range(start, min(start + 8, 75)))
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            results = list(ex.map(one, batch))
-        empty_hit = False
-        for pn, diff, tot in results:
-            if diff is None:
-                failed.append(pn)
-                continue
-            if tot:
-                total = tot
-            if not diff:
-                empty_hit = True
-                continue
-            allrows.extend(diff)
-        if total and len(allrows) >= total:
-            break
-        if empty_hit:
-            break
-        time.sleep(0.25)
+    # 1) 探第一页，确定总页数
+    _, diff0, total = one(1, tries=3, timeout=15)
+    if diff0 is None:
+        print("      ! 首页就取不到，跳过全 A")
+        return [], 0, 99
+    if not diff0:
+        return [], 0, 0
+
+    got = {1: diff0}
+    npages = max(1, (int(total or len(diff0)) + 99) // 100)
+    npages = min(npages, 80)
+
+    # 2) 并发 2 逐轮拉
+    rest = [p for p in range(2, npages + 1)]
+    for i in range(0, len(rest), 2):
+        batch = rest[i:i + 2]
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            for pn, diff, tot in ex.map(one, batch):
+                if diff is not None:
+                    got[pn] = diff
+                    if tot and not total:
+                        total = tot
+        time.sleep(0.2)
+
+    # 3) 补拉漏掉的页，串行、慢一点；总时长封顶，避免把工作流拖到超时
+    missing = [p for p in range(1, npages + 1) if p not in got]
+    if missing:
+        print("      补拉 %d 页" % len(missing))
+        t0 = time.time()
+        for pn in missing:
+            if time.time() - t0 > 330:
+                print("      ! 补拉已用 5.5 分钟，剩下的不追了")
+                break
+            _, diff, tot = one(pn, tries=1, timeout=12)
+            if diff is not None:
+                got[pn] = diff
+                if tot and not total:
+                    total = tot
+            time.sleep(0.45)
+
+    allrows = []
+    for pn in sorted(got):
+        allrows.extend(got[pn])
+    failed = [p for p in range(1, npages + 1) if p not in got]
     if failed:
         print("      ! %d 页失败：%s" % (len(failed), str(failed[:12])[1:-1]))
     return allrows, (total or len(allrows)), len(failed)
@@ -225,9 +250,9 @@ def fetch_sector_boards():
     与市值加权口径有差异——四大行涨、小城商行跌时，算术平均会把银行拉得很平。
     所以只在全 A 数据不足时启用，报告里会标注口径变化。
     """
-    url = ("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=200&po=1&np=1"
+    url = ("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=100&po=1&np=1"
            "&fltt=2&invt=2&fid=f3&fs=m:90+t:2+f:!50&fields=f12,f14,f3")
-    j = get_json(url)
+    j = get_json(url, tries=5, timeout=18)
     by = {}
     for r in (j.get("data") or {}).get("diff") or []:
         by[r.get("f14")] = num(r.get("f3"))
@@ -1119,8 +1144,9 @@ def main():
 
     # 全 A（行业市值加权的原料）；数据不够就降级，不让整份报告失败
     rows_a, total_a, fail_pages = fetch_all_a()
-    print(f"[3/8] 全 A {len(rows_a)} / {total_a}（失败 {fail_pages} 页）")
-    enough = len(rows_a) >= 3000 and fail_pages <= 12
+    cover = (len(rows_a) / total_a) if total_a else 0
+    print(f"[3/8] 全 A {len(rows_a)} / {total_a}（覆盖 {cover*100:.0f}%，失败 {fail_pages} 页）")
+    enough = len(rows_a) >= 3000 and cover >= 0.70
 
     if enough:
         up, dn, flat = compute_breadth(rows_a)
@@ -1141,7 +1167,8 @@ def main():
     # 板块
     if enough:
         sectors = pick_sectors(compute_sectors(rows_a))
-        sector_src = "总市值加权"
+        sector_src = ("总市值加权" if cover >= 0.99
+                      else "总市值加权·样本 %.0f%%" % (cover * 100))
     else:
         print("      全A 数据不足，板块降级为东财板块指数")
         sectors = fetch_sector_boards()
