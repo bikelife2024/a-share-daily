@@ -82,19 +82,28 @@ OVERSEAS = [
     ("100.HSI", "恒生指数"),
 ]
 
-# 固定跟踪的行业（东方财富二级行业名，总市值加权自算）
-SECTORS = [
-    "半导体", "软件开发", "计算机设备", "IT服务Ⅱ", "通信设备", "元件", "消费电子",
-    "光伏设备", "电池", "电网设备", "风电设备", "军工电子Ⅱ", "航空装备Ⅱ",
-    "汽车零部件", "工业金属", "化学制药", "医疗器械",
-    "房地产开发", "银行Ⅱ", "证券Ⅱ", "保险Ⅱ", "煤炭开采", "白酒Ⅱ", "白色家电", "食品加工",
+# 固定跟踪的行业：申万一级（东方财富板块指数）。
+# 用 BK 代码走 ulist 批量查询，两次请求就能拿全，不依赖 clist 分页
+# （东财对云端 IP 的 clist 分页限制极严，60 页根本拉不完）。
+# 口径说明：板块指数本身是板块内成分股等权，与「全 A 总市值加权」不同，
+# 银行这类大小票分化的板块会被拉平，读的时候要记住这一点。
+SECTORS_L1 = [
+    ("BK0433", "农林牧渔"), ("BK1206", "基础化工"), ("BK0479", "钢铁"),
+    ("BK0478", "有色金属"), ("BK1201", "电子"), ("BK0456", "家用电器"),
+    ("BK0438", "食品饮料"), ("BK0436", "纺织服饰"), ("BK1212", "轻工制造"),
+    ("BK1216", "医药生物"), ("BK0427", "公用事业"), ("BK1210", "交通运输"),
+    ("BK1202", "房地产"), ("BK1213", "商贸零售"), ("BK1214", "社会服务"),
+    ("BK1283", "银行"), ("BK1203", "非银金融"), ("BK1217", "综合"),
+    ("BK1208", "建筑材料"), ("BK1209", "建筑装饰"), ("BK1200", "电力设备"),
+    ("BK1205", "机械设备"), ("BK1204", "国防军工"), ("BK1207", "计算机"),
+    ("BK0486", "传媒"), ("BK1215", "通信"), ("BK0437", "煤炭"),
+    ("BK0464", "石油石化"), ("BK0728", "环保"), ("BK1035", "美容护理"),
 ]
 
-SECTOR_ALIAS = {
-    "IT服务Ⅱ": "IT服务", "军工电子Ⅱ": "军工电子", "航空装备Ⅱ": "航空装备",
-    "银行Ⅱ": "银行", "证券Ⅱ": "证券", "保险Ⅱ": "保险", "白酒Ⅱ": "白酒",
-    "煤炭开采": "煤炭行业",
-}
+# 科技链的代表行业（用于「是不是只有 AI 硬件在跌」这个判断）
+TECH_NAMES = ("电子", "计算机", "通信")
+
+SECTOR_ALIAS = {}
 
 
 # ── HTTP ───────────────────────────────────────────────────────
@@ -246,27 +255,34 @@ def fetch_breadth_fast():
 
 
 def fetch_sector_boards():
-    """备用路径：直接用东财行业板块指数的涨跌幅（板块内个股算术平均）。
+    """申万一级行业的涨跌幅，走 ulist 按 BK 代码批量取。
 
-    与市值加权口径有差异——四大行涨、小城商行跌时，算术平均会把银行拉得很平。
-    所以只在全 A 数据不足时启用，报告里会标注口径变化。
+    分两批发（15 个一批），每批一次请求。ulist 这个接口在云端 IP 上验证过很稳
+    （连发 8 次全成功），比 clist 分页可靠得多。
     """
-    url = ("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=100&po=1&np=1"
-           "&fltt=2&invt=2&fid=f3&fs=m:90+t:2+f:!50&fields=f12,f14,f3")
-    j = get_json(url, tries=5, timeout=18)
-    by = {}
-    for r in (j.get("data") or {}).get("diff") or []:
-        by[r.get("f14")] = num(r.get("f3"))
-    print("      板块接口返回 %d 个：%s" % (len(by), "、".join(list(by)[:10])))
+    got = {}
+    for i in range(0, len(SECTORS_L1), 15):
+        chunk = SECTORS_L1[i:i + 15]
+        secids = ",".join("90." + c for c, _ in chunk)
+        url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
+               "&fields=f2,f3,f6,f12,f14&secids=" + secids)
+        j = get_json(url, tries=4, timeout=15)
+        for r in (j.get("data") or {}).get("diff") or []:
+            code = str(r.get("f12") or "").strip()
+            pct = num(r.get("f3"))
+            if code and pct is not None:
+                got[code] = (pct, num(r.get("f6")))
+
+    if not got:
+        return []
+
     out = []
-    for name in SECTORS:
-        alias = SECTOR_ALIAS.get(name, name)
-        v = by.get(name)
-        if v is None:
-            v = by.get(alias)
-        if v is None:
+    for code, name in SECTORS_L1:
+        v = got.get(code) or got.get("BK" + code.replace("BK", ""))
+        if not v:
             continue
-        out.append({"name": alias, "pct": round(v, 2), "n": 0, "mcap": 0})
+        out.append({"name": name, "pct": round(v[0], 2), "n": 0, "amount": v[1]})
+    print("      板块取到 %d / %d 个" % (len(out), len(SECTORS_L1)))
     out.sort(key=lambda x: -x["pct"])
     return out
 
@@ -307,18 +323,14 @@ def compute_sectors(rows):
 
 
 def pick_sectors(all_sectors):
+    """（保留给「全 A 自算」那条路，目前主路径走 fetch_sector_boards）"""
     idx = {s["name"]: s for s in all_sectors}
     picked = []
-    for name in SECTORS:
+    for _code, name in SECTORS_L1:
         s = idx.get(name)
         if not s:
             continue
-        picked.append({
-            "name": SECTOR_ALIAS.get(name, name),
-            "pct": s["pct"],
-            "n": s["n"],
-            "mcap": s["mcap"],
-        })
+        picked.append({"name": name, "pct": s["pct"], "n": s["n"], "mcap": s["mcap"]})
     picked.sort(key=lambda x: -x["pct"])
     return picked
 
@@ -515,7 +527,7 @@ def anchor_state(idx, overseas, sectors, limits, margin_delta, breadth):
         out.append(("杠杆锚", False, f"两融单日再降 {abs(margin_delta):.0f} 亿，被动去杠杆未结束"))
 
     # 3 结构锚：前期强势方向是否补跌
-    strong = [s for s in sectors if s["name"] in ("半导体", "通信设备", "软件开发", "计算机设备", "元件")]
+    strong = [s for s in sectors if s["name"] in TECH_NAMES]
     if strong:
         avg = mean([s["pct"] for s in strong])
         if avg <= -3:
@@ -897,7 +909,7 @@ def render(data):
     worst_os = min(overseas, key=lambda x: x["pct"] if x["pct"] is not None else 0) if overseas else None
     us_line = "、".join(f'{o["name"]} {spct(o["pct"])}' for o in overseas[:3])
     asia_line = "、".join(f'{o["name"]} {spct(o["pct"])}' for o in overseas[3:6])
-    strong_secs = [s for s in sectors if s["name"] in ("半导体", "通信设备", "软件开发", "计算机设备")]
+    strong_secs = [s for s in sectors if s["name"] in TECH_NAMES]
     strong_txt = "、".join(f'{s["name"]} {spct(s["pct"])}' for s in strong_secs) or "—"
     m_latest = margin[-1] if margin else None
     m_delta = data.get("margin_delta")
@@ -947,7 +959,7 @@ def render(data):
 
 <h2>三、板块强弱</h2>
 <div class="chartbox"><div id="chartSector" class="chart" style="height:560px;"></div>
-<div class="cap">固定跟踪的 25 个行业（东方财富二级行业分类），<strong>{data["sector_src"]}</strong>，自下而上由弱到强。
+<div class="cap">固定跟踪的 30 个申万一级行业（东方财富板块指数），<strong>{data["sector_src"]}</strong>，自下而上由弱到强。
 口径提示：历史几期用的是申万分类，从本期起统一为东财分类以便与公开接口对齐，数值会与旧报告存在小幅口径差。</div></div>
 <div class="tbl-wrap"><table>
 <thead><tr><th>行业</th><th>涨跌幅</th><th>成分股数</th></tr></thead>
@@ -1036,10 +1048,9 @@ def build_texts(data):
                  f'涨跌比 1:{dn / up:.1f}。' if up else "")
     data["texture"] = "".join(p for p in parts if p)
 
-    # 板块解读
-    non_ai = [s for s in sectors if s["name"] in ("光伏设备", "电池", "电网设备", "风电设备",
-                                                  "军工电子", "航空装备", "房地产开发", "汽车零部件")]
-    non_ai_deep = [s for s in non_ai if s["pct"] <= -3]
+    # 板块解读：把「科技链」和「非科技」分开看，才能判断是调仓还是全面收缩
+    non_ai = [s for s in sectors if s["name"] not in TECH_NAMES]
+    non_ai_deep = sorted([s for s in non_ai if s["pct"] <= -3], key=lambda x: x["pct"])
     st = []
     if non_ai_deep:
         names = "、".join("%s（%s）" % (s["name"], spct(s["pct"])) for s in non_ai_deep[:4])
@@ -1228,7 +1239,7 @@ def main():
     data["headline"], data["mode"] = headline, mode
 
     data["os_line"] = "、".join(f'{o["name"]} {spct(o["pct"])}' for o in overseas[:3])
-    strong_secs = [s for s in sectors if s["name"] in ("半导体", "通信设备", "软件开发", "计算机设备", "元件")]
+    strong_secs = [s for s in sectors if s["name"] in TECH_NAMES]
     data["strong_avg"] = mean([s["pct"] for s in strong_secs]) if strong_secs else 0.0
 
     data["anchors"] = anchor_state(idx, overseas, sectors, limits, margin_delta, (up, dn, flat))
