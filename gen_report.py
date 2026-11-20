@@ -17,6 +17,7 @@ import sys
 import time
 import urllib.request
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -37,17 +38,39 @@ INDICES = [
     ("0.899050", "北证50"),
 ]
 
-HOLDINGS = [
-    ("1.600415", "600415", "小商品城"),
-    ("0.002416", "002416", "爱施德"),
-    ("1.600420", "600420", "国药现代"),
-    ("0.300586", "300586", "美联新材"),
-    ("1.600589", "600589", "大位科技"),
-]
+def _load_holdings():
+    """持仓从同目录的 holdings.json 读取，该文件不进仓库（.gitignore 已排除）。
 
-# 持仓跟踪这一节是否写进页面。发布到公开站点时应设为 0（SHOW_HOLDINGS=0），
-# 本地自己看默认保留。仓库是 public 才能用免费 Pages，页面等于对外公开。
-SHOW_HOLDINGS = os.environ.get("SHOW_HOLDINGS", "1").strip() not in ("0", "false", "False", "")
+    这样公开仓库里的源码不会出现任何个股。文件格式：
+        [{"secid": "1.600415", "code": "600415", "name": "小商品城"}, ...]
+    文件不存在时返回空列表，页面自动省掉持仓那一节。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "holdings.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        rows = json.load(open(path, encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for r in rows:
+        code = str(r.get("code") or "").strip()
+        name = str(r.get("name") or "").strip()
+        secid = str(r.get("secid") or "").strip()
+        if not (code and name):
+            continue
+        if not secid:
+            secid = ("1." if code.startswith(("6", "5", "9")) else "0.") + code
+        out.append((secid, code, name))
+    return out
+
+
+HOLDINGS = _load_holdings()
+
+# 持仓节是否写进页面：既要开关打开，也要确实有持仓数据
+SHOW_HOLDINGS = (os.environ.get("SHOW_HOLDINGS", "1").strip()
+                 not in ("0", "false", "False", "")) and bool(HOLDINGS)
 
 OVERSEAS = [
     ("100.DJIA", "道琼斯"),
@@ -126,42 +149,99 @@ def fetch_indices():
 
 
 def fetch_all_a():
-    """全 A 股（含北交所），用于涨跌家数与行业加权。
+    """全 A 股（含北交所），用于行业市值加权。
 
     东方财富对 clist 的单页条数有限制（pz 明显超过 100 会直接断连），
-    且对短时间内的请求频次敏感。所以固定 pz=100、每页之间留间隔，
-    单页失败先重试（指数退避），仍失败才跳过该页，不让整份报告崩掉。
+    而在跨境链路上单请求又很慢，逐页串行会拖到十几分钟。
+    所以改成小批量并发：每批 8 页同时发，批与批之间留间隔。
+    单页失败记下来，由调用方判断数据是否够用、要不要降级。
     """
     base = ("https://push2.eastmoney.com/api/qt/clist/get?pn={pn}&pz=100&po=1&np=1"
             "&fltt=2&invt=2&fid=f12"
             "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
             "&fields=f12,f14,f3,f20,f100")
-    allrows, total, failed = [], None, 0
-    for pn in range(1, 75):
-        j, last = None, None
-        for attempt in range(4):
-            try:
-                j = get_json(base.format(pn=pn), tries=2, timeout=30)
-                break
-            except Exception as e:  # noqa: BLE001
-                last = e
-                time.sleep(1.5 * (2 ** attempt))
-        if j is None:
-            failed += 1
-            print("      ! 第 %d 页取数失败（%s），跳过" % (pn, last))
-            continue
-        data = j.get("data") or {}
-        diff = data.get("diff") or []
-        if not diff:
-            break
-        total = data.get("total") or total
-        allrows.extend(diff)
+
+    def one(pn):
+        try:
+            j = get_json(base.format(pn=pn), tries=2, timeout=15)
+            d = j.get("data") or {}
+            return pn, (d.get("diff") or []), d.get("total")
+        except Exception:  # noqa: BLE001
+            return pn, None, None
+
+    allrows, total, failed = [], None, []
+    for start in range(1, 75, 8):
+        batch = list(range(start, min(start + 8, 75)))
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            results = list(ex.map(one, batch))
+        empty_hit = False
+        for pn, diff, tot in results:
+            if diff is None:
+                failed.append(pn)
+                continue
+            if tot:
+                total = tot
+            if not diff:
+                empty_hit = True
+                continue
+            allrows.extend(diff)
         if total and len(allrows) >= total:
             break
-        time.sleep(0.3)
+        if empty_hit:
+            break
+        time.sleep(0.25)
     if failed:
-        print("      ! 共 %d 页跳过，涨跌家数会略有偏差" % failed)
-    return allrows, (total or len(allrows))
+        print("      ! %d 页失败：%s" % (len(failed), str(failed[:12])[1:-1]))
+    return allrows, (total or len(allrows)), len(failed)
+
+
+def fetch_breadth_fast():
+    """全市场涨跌家数（备用路径）。
+
+    上证指数、深证综指、北证50 的成分股分别覆盖沪、深、北三市全部 A 股，
+    它们的 f104/f105/f106 就是各自市场的涨/跌/平家数，三项相加即全市场。
+    一次请求就能拿到，不必依赖全 A 分页。
+    """
+    url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
+           "&fields=f12,f14,f104,f105,f106"
+           "&secids=1.000001,0.399106,0.899050")
+    j = get_json(url)
+    up = dn = flat = 0
+    got = False
+    for d in (j.get("data") or {}).get("diff") or []:
+        a, b, c = num(d.get("f104")), num(d.get("f105")), num(d.get("f106"))
+        if a is None and b is None:
+            continue
+        got = True
+        up += int(a or 0)
+        dn += int(b or 0)
+        flat += int(c or 0)
+    return (up, dn, flat) if got else None
+
+
+def fetch_sector_boards():
+    """备用路径：直接用东财行业板块指数的涨跌幅（板块内个股算术平均）。
+
+    与市值加权口径有差异——四大行涨、小城商行跌时，算术平均会把银行拉得很平。
+    所以只在全 A 数据不足时启用，报告里会标注口径变化。
+    """
+    url = ("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=200&po=1&np=1"
+           "&fltt=2&invt=2&fid=f3&fs=m:90+t:2+f:!50&fields=f12,f14,f3")
+    j = get_json(url)
+    by = {}
+    for r in (j.get("data") or {}).get("diff") or []:
+        by[r.get("f14")] = num(r.get("f3"))
+    out = []
+    for name in SECTORS:
+        alias = SECTOR_ALIAS.get(name, name)
+        v = by.get(name)
+        if v is None:
+            v = by.get(alias)
+        if v is None:
+            continue
+        out.append({"name": alias, "pct": round(v, 2), "n": 0, "mcap": 0})
+    out.sort(key=lambda x: -x["pct"])
+    return out
 
 
 def compute_breadth(rows):
@@ -838,7 +918,7 @@ def render(data):
 
 <h2>三、板块强弱</h2>
 <div class="chartbox"><div id="chartSector" class="chart" style="height:560px;"></div>
-<div class="cap">固定跟踪的 25 个行业（东方财富二级行业分类），<strong>总市值加权</strong>自算，自下而上由弱到强。
+<div class="cap">固定跟踪的 25 个行业（东方财富二级行业分类），<strong>{data["sector_src"]}</strong>，自下而上由弱到强。
 口径提示：历史几期用的是申万分类，从本期起统一为东财分类以便与公开接口对齐，数值会与旧报告存在小幅口径差。</div></div>
 <div class="tbl-wrap"><table>
 <thead><tr><th>行业</th><th>涨跌幅</th><th>成分股数</th></tr></thead>
@@ -1037,16 +1117,40 @@ def main():
         print(f"· 休市（最新交易日 {last_date}，今天 {today}），跳过")
         return 0
 
-    # 全 A
-    rows_a, total_a = fetch_all_a()
-    print(f"[3/8] 全 A {len(rows_a)} / {total_a}")
-    up, dn, flat = compute_breadth(rows_a)
-    print(f"      上涨 {up} 下跌 {dn} 平 {flat}")
+    # 全 A（行业市值加权的原料）；数据不够就降级，不让整份报告失败
+    rows_a, total_a, fail_pages = fetch_all_a()
+    print(f"[3/8] 全 A {len(rows_a)} / {total_a}（失败 {fail_pages} 页）")
+    enough = len(rows_a) >= 3000 and fail_pages <= 12
+
+    if enough:
+        up, dn, flat = compute_breadth(rows_a)
+        breadth_src = "全A自算"
+    else:
+        fast = fetch_breadth_fast()
+        if fast:
+            up, dn, flat = fast
+            breadth_src = "指数成分统计"
+        elif rows_a:
+            up, dn, flat = compute_breadth(rows_a)
+            breadth_src = "全A自算（数据不全）"
+        else:
+            print("✗ 拿不到涨跌家数，退出")
+            return 2
+    print(f"      上涨 {up} 下跌 {dn} 平 {flat}（{breadth_src}）")
 
     # 板块
-    all_sec = compute_sectors(rows_a)
-    sectors = pick_sectors(all_sec)
-    print(f"[4/8] 板块 {len(sectors)} 个：{sectors[0]['name']} {sectors[0]['pct']}% … {sectors[-1]['name']} {sectors[-1]['pct']}%")
+    if enough:
+        sectors = pick_sectors(compute_sectors(rows_a))
+        sector_src = "总市值加权"
+    else:
+        print("      全A 数据不足，板块降级为东财板块指数")
+        sectors = fetch_sector_boards()
+        sector_src = "板块指数（算术平均）"
+    if not sectors:
+        print("✗ 拿不到板块数据，退出")
+        return 2
+    print(f"[4/8] 板块 {len(sectors)} 个（{sector_src}）："
+          f"{sectors[0]['name']} {sectors[0]['pct']}% … {sectors[-1]['name']} {sectors[-1]['pct']}%")
 
     # 涨跌停
     limits = fetch_limits(last_date.replace("-", ""))
@@ -1094,6 +1198,8 @@ def main():
         "overseas": overseas,
         "tech": techs,
         "holdings": holdings,
+        "sector_src": sector_src,
+        "breadth_src": breadth_src,
         "two_mkt_prev": two_mkt_prev,
         "date_cn": now.strftime("%Y年%-m月%-d日") if os.name != "nt" else now.strftime("%Y年%m月%d日"),
         "gen_at": now.strftime("%H:%M"),
