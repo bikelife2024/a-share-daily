@@ -1,0 +1,52 @@
+name: A股收盘复盘
+
+# 北京时间 16:10 = UTC 08:10，周一到周五
+on:
+  schedule:
+    - cron: "10 8 * * 1-5"
+  workflow_dispatch:        # 也可以在 Actions 页面手动点一下立即跑
+
+permissions:
+  contents: write           # 需要写权限把 docs/ 提交回去（往期存档靠它）
+
+concurrency:
+  group: a-share-daily
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 生成复盘
+        env:
+          SHOW_HOLDINGS: "0"   # 站点是公开的，不写个股持仓；本地自己看时去掉这行即可
+        run: python gen_report.py --out docs
+
+      - name: 提交到仓库（GitHub Pages 从 docs/ 发布）
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs
+          if git diff --staged --quiet; then
+            echo "今天没有新内容（休市或已生成过），跳过提交"
+          else
+            git commit -m "report: $(TZ=Asia/Shanghai date +%F)"
+            git push
+          fi
+
+      - name: 推送到微信
+        env:
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          SERVERCHAN_URL: ${{ secrets.SERVERCHAN_URL }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          SITE_URL: ${{ vars.SITE_URL }}
+        run: python push.py
