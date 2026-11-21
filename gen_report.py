@@ -43,7 +43,8 @@ def _load_holdings():
     """持仓从同目录的 holdings.json 读取，该文件不进仓库（.gitignore 已排除）。
 
     这样公开仓库里的源码不会出现任何个股。文件格式：
-        [{"secid": "1.600415", "code": "600415", "name": "小商品城"}, ...]
+        [{"secid": "1.600415", "code": "600415", "name": "小商品城", "cost": 11.5}, ...]
+    cost 可省略；给了就在推送摘要里一并算出浮动盈亏。
     文件不存在时返回空列表，页面自动省掉持仓那一节。
     """
     here = os.path.dirname(os.path.abspath(__file__))
@@ -63,7 +64,11 @@ def _load_holdings():
             continue
         if not secid:
             secid = ("1." if code.startswith(("6", "5", "9")) else "0.") + code
-        out.append((secid, code, name))
+        try:
+            cost = float(r.get("cost")) if r.get("cost") not in (None, "") else None
+        except (TypeError, ValueError):
+            cost = None
+        out.append((secid, code, name, cost))
     return out
 
 
@@ -667,7 +672,15 @@ def fetch_kline(secid, limit=140):
 def fetch_holdings():
     if not HOLDINGS:
         return []
-    secids = ",".join(s for s, _, _ in HOLDINGS)
+    out = _holdings_em()
+    if out:
+        return out
+    print("      ! 东财持仓接口不可用，改走腾讯")
+    return _holdings_qq()
+
+
+def _holdings_em():
+    secids = ",".join(s for s, _, _, _ in HOLDINGS)
     url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
            f"&secids={secids}&fields=f2,f3,f6,f8,f10,f12,f14")
     j = None
@@ -679,7 +692,7 @@ def fetch_holdings():
     for row in (j.get("data") or {}).get("diff") or []:
         by_code[row.get("f12")] = row
     out = []
-    for _, code, name in HOLDINGS:
+    for _, code, name, cost in HOLDINGS:
         row = by_code.get(code) or {}
         out.append({
             "code": code,
@@ -689,6 +702,46 @@ def fetch_holdings():
             "amount": num(row.get("f6")),
             "turnover": num(row.get("f8")),
             "volratio": num(row.get("f10")),
+            "cost": cost,
+        })
+    # 一条都没取到就当作失败，交给腾讯兜底
+    if all(x["close"] is None for x in out):
+        return []
+    return out
+
+
+def _holdings_qq():
+    """腾讯兜底：一次请求拿全部持仓的现价与涨跌幅。成交额字段是万元。"""
+    codes = [("sh" if s.startswith("1.") else "sz") + c for s, c, _, _ in HOLDINGS]
+    try:
+        txt = get_text("https://qt.gtimg.cn/q=" + ",".join(codes), encoding="gbk")
+    except Exception as e:  # noqa: BLE001
+        print("      ! 腾讯持仓兜底失败：", e)
+        return []
+    by = {}
+    for line in txt.strip().split("\n"):
+        if '="' not in line:
+            continue
+        parts = line.split('="', 1)[1].rstrip('";').split("~")
+        if len(parts) < 38:
+            continue
+        by[parts[2]] = parts
+    out = []
+    for _, code, name, cost in HOLDINGS:
+        p = by.get(code)
+        if not p:
+            out.append({"code": code, "name": name, "close": None, "pct": None,
+                        "amount": None, "turnover": None, "volratio": None, "cost": cost})
+            continue
+        out.append({
+            "code": code,
+            "name": name,
+            "close": num(p[3]),
+            "pct": num(p[32]),
+            "amount": (num(p[37]) or 0) * 1e4,
+            "turnover": num(p[38]),
+            "volratio": None,
+            "cost": cost,
         })
     return out
 
@@ -1538,24 +1591,39 @@ def render(data):
 
     # —— 持仓行
     rows_hold = ""
+    has_cost = any(h.get("cost") for h in holdings)
     bench = next((x for x in idx if x["code"] == "000001"), None)
     bench_pct = bench["pct"] if bench else 0
     for h in holdings:
         rel = (h["pct"] - (bench_pct or 0)) if h["pct"] is not None else None
+        close_txt = "{:,.2f}".format(h["close"]) if h["close"] is not None else "—"
+        turn_txt = "%.2f%%" % h["turnover"] if h["turnover"] is not None else "—"
+        vr_txt = "%.2f" % h["volratio"] if h["volratio"] is not None else "—"
+        extra = ""
+        if has_cost:
+            cost = h.get("cost")
+            if cost and h["close"]:
+                fp = (h["close"] / cost - 1) * 100
+                extra = (f'<td>{cost:.3f}</td>'
+                         f'<td class="{cls(fp)}">{spct(fp, 1)}</td>')
+            else:
+                extra = "<td>—</td><td>—</td>"
         rows_hold += (f'<tr><td>{h["name"]}<span style="color:#8d8a83;font-size:11px"> {h["code"]}</span></td>'
-                      f'<td>{h["close"]:,.2f}</td>'
+                      f'<td>{close_txt}</td>'
                       f'<td class="{cls(h["pct"])}">{spct(h["pct"])}</td>'
+                      + extra +
                       f'<td>{fmt_money(h["amount"])}</td>'
-                      f'<td>{h["turnover"]:.2f}%</td>'
-                      f'<td>{h["volratio"]:.2f}</td>'
+                      f'<td>{turn_txt}</td>'
+                      f'<td>{vr_txt}</td>'
                       f'<td class="{cls(rel)}">{spct(rel, 1)}</td></tr>')
 
     # 持仓节：发布到公开站点时用 SHOW_HOLDINGS=0 关掉，节编号跟着顺延
     if SHOW_HOLDINGS:
         hold_section = ('<h2>十、持仓跟踪</h2>\n'
                         '<div class="tbl-wrap"><table>\n'
-                        '<thead><tr><th>股票</th><th>收盘</th><th>涨跌幅</th><th>成交额</th>'
-                        '<th>换手</th><th>量比</th><th>相对上证</th></tr></thead>\n'
+                        '<thead><tr><th>股票</th><th>收盘</th><th>涨跌幅</th>'
+                        + ("<th>成本</th><th>浮动</th>" if has_cost else "") +
+                        '<th>成交额</th><th>换手</th><th>量比</th><th>相对上证</th></tr></thead>\n'
                         '<tbody>' + rows_hold + '</tbody></table></div>\n'
                         '<p>' + (data.get("holding_text") or "") + '</p>\n'
                         '<div class="note">只跟踪当日强弱，不用历史记录中的成本价推算盈亏'
@@ -1949,6 +2017,190 @@ def build_texts(data):
     return data
 
 
+def _yi(v):
+    """金额（元）→ 带符号的亿元文本，推送正文用"""
+    if v is None:
+        return "—"
+    return "%+.1f 亿" % (v / 1e8)
+
+
+def build_digest(data):
+    """微信推送用的正文。
+
+    微信把 github.io 以及各类个人域名都归进外链拦截，点开就是"已停止访问"。
+    但 Server酱 的消息详情页本身在微信白名单内，正文能正常渲染，
+    所以正文必须自给自足：关键数字全写进来，链接只当"想看图表"的出口。
+    返回 (digest 长文, brief 卡片描述)。
+    """
+    idx = data.get("idx") or []
+    sectors = data.get("sectors") or []
+    flow = data.get("flow") or {}
+    flow_sec = data.get("flow_sectors") or {}
+    pools = data.get("pools") or {}
+    lhb = data.get("lhb") or []
+    hs = data.get("holdings") or []
+    anchors = data.get("anchors") or []
+    limits = data.get("limits") or [None, None]
+    up, dn, flat = (data.get("breadth") or (None, None, None))[:3]
+    headline = data.get("headline") or "今日复盘"
+
+    cy_pct = None
+    for x in idx:
+        if str(x.get("code")) == "399006":
+            cy_pct = x.get("pct")
+
+    L = []
+    L.append("**%s**" % headline)
+    tag = []
+    if data.get("grade"):
+        tag.append("档位 %s（%d/4 条锚到位）" % (data["grade"], data.get("hit") or 0))
+    if data.get("mode") and data["mode"] not in headline:
+        tag.append(data["mode"])
+    if tag:
+        L.append("")
+        L.append("　".join(tag))
+
+    # ── 指数
+    if idx:
+        L.append("")
+        L.append("**指数**")
+        for x in idx[:5]:
+            L.append("· %s %s（%s）" % (x["name"], "{:,.2f}".format(x["close"]),
+                                      spct(x.get("pct"))))
+        if len(idx) >= 2:
+            amt = (idx[0].get("amount") or 0) + (idx[1].get("amount") or 0)
+            if amt > 0:
+                txt = "· 两市成交 %s" % fmt_money(amt)
+                prev = data.get("two_mkt_prev")
+                if prev:
+                    chg = (amt / prev - 1) * 100
+                    txt += "（较前日%s %.1f%%）" % ("放量" if chg > 0 else "缩量", abs(chg))
+                L.append(txt)
+
+    # ── 资金
+    if flow:
+        L.append("")
+        L.append("**资金流向**")
+        L.append("· 主力 %s（沪 %s ／ 深 %s）" % (
+            _yi(flow.get("main")),
+            _yi((flow.get("sh") or {}).get("main")),
+            _yi((flow.get("sz") or {}).get("main"))))
+        if flow.get("xl") is not None or flow.get("lg") is not None:
+            L.append("· 超大单 %s ／ 大单 %s" % (_yi(flow.get("xl")), _yi(flow.get("lg"))))
+        inflow = sorted([(k, v) for k, v in flow_sec.items() if v and v > 0],
+                        key=lambda x: -x[1])[:3]
+        outflow = sorted([(k, v) for k, v in flow_sec.items() if v and v < 0],
+                         key=lambda x: x[1])[:3]
+        if inflow:
+            L.append("· 行业流入：" + "、".join("%s %s" % (k, _yi(v)) for k, v in inflow))
+        if outflow:
+            L.append("· 行业流出：" + "、".join("%s %s" % (k, _yi(v)) for k, v in outflow))
+
+    # ── 情绪
+    zt_rows = pools.get("zt") or []
+    zt_n = pools.get("zt_n")
+    dt_n = pools.get("dt_n")
+    zb_n = pools.get("zb_n")
+    if zt_n is None:
+        zt_n = limits[0]
+    if dt_n is None:
+        dt_n = limits[1]
+    emo = []
+    if up is not None:
+        tot = (up or 0) + (dn or 0) + (flat or 0)
+        r = "，上涨占比 %.1f%%" % (up / tot * 100) if tot else ""
+        emo.append("涨 %s ／ 跌 %s ／ 平 %s%s" % (up, dn, flat, r))
+    one = "涨停 %s ／ 跌停 %s" % (zt_n if zt_n is not None else "—",
+                               dt_n if dt_n is not None else "—")
+    if zb_n is not None:
+        one += " ／ 炸板 %s" % zb_n
+        if zt_n and (zt_n + zb_n):
+            one += "（炸板率 %.0f%%）" % (zb_n / (zt_n + zb_n) * 100)
+    emo.append(one)
+    if zt_rows:
+        mx = max((x.get("boards") or 1) for x in zt_rows)
+        if mx > 1:
+            lead = [x["name"] for x in zt_rows if (x.get("boards") or 1) == mx][:3]
+            emo.append("最高 %d 连板：%s" % (mx, "、".join(lead)))
+    if emo:
+        L.append("")
+        L.append("**情绪**")
+        for x in emo:
+            L.append("· " + x)
+
+    # ── 异动板块
+    if sectors:
+        top, bot = sectors[0], sectors[-1]
+        upn = len([s for s in sectors if (s.get("pct") or 0) > 0])
+        L.append("")
+        L.append("**异动板块**")
+        L.append("· 最强 %s %s ／ 最弱 %s %s（差 %.1f 个点）" % (
+            top["name"], spct(top.get("pct")), bot["name"], spct(bot.get("pct")),
+            (top.get("pct") or 0) - (bot.get("pct") or 0)))
+        L.append("· %d 个一级行业：%d 涨 / %d 跌" % (
+            len(sectors), upn, len(sectors) - upn))
+
+    # ── 异动个股
+    stock_rows = []
+    buys = [x for x in lhb if (x.get("net") or 0) > 0][:3]
+    if buys:
+        stock_rows.append("· 龙虎榜净买：" + "、".join(
+            "%s %s" % (x["name"], _yi(x.get("net"))) for x in buys))
+    sells = sorted([x for x in lhb if (x.get("net") or 0) < -1e7],
+                   key=lambda x: x.get("net"))
+    if sells:
+        stock_rows.append("· 龙虎榜净卖：" + "、".join(
+            "%s %s" % (x["name"], _yi(x.get("net"))) for x in sells[:2]))
+    if zt_rows:
+        lead2 = sorted(zt_rows, key=lambda x: (-(x.get("boards") or 1),
+                                               -(x.get("fund") or 0)))[:5]
+        stock_rows.append("· 涨停梯队：" + "、".join(
+            "%s %d板" % (x["name"], x.get("boards") or 1) for x in lead2))
+    zbs = sorted(pools.get("zb") or [], key=lambda x: -(x.get("open") or 0))[:2]
+    if zbs:
+        stock_rows.append("· 反复炸板：" + "、".join(
+            "%s %d 次" % (x["name"], x.get("open") or 1) for x in zbs))
+    if stock_rows:
+        L.append("")
+        L.append("**异动个股**")
+        L.extend(stock_rows)
+
+    # ── 持仓（口径与页面一致：公开版 SHOW_HOLDINGS=0 时整段不写，
+    #    因为 digest 会落进公开的 issues.json，不能只靠"页面不渲染"来挡）
+    if hs and SHOW_HOLDINGS:
+        L.append("")
+        L.append("**持仓**")
+        for h in hs:
+            p = h.get("pct")
+            t = "· %s %s" % (h["name"], spct(p) if p is not None else "—")
+            c, cost = h.get("close"), h.get("cost")
+            if c and cost:
+                t += "（收 %.2f ／ 成本 %.2f ／ %s）" % (c, cost, spct((c / cost - 1) * 100))
+            L.append(t)
+
+    # ── 四条锚
+    if anchors:
+        L.append("")
+        L.append("**四条锚**")
+        for name, ok, txt in anchors:
+            L.append("%s %s · %s" % ("[到位]" if ok else "[未到位]", name, txt))
+
+    # ── 卡片描述：微信通知栏里就能看到的那行
+    brief = headline
+    if idx:
+        brief += "｜上证 %s" % spct(idx[0].get("pct"))
+        if cy_pct is not None:
+            brief += " 创业板 %s" % spct(cy_pct)
+    if flow:
+        brief += " 主力 %s" % _yi(flow.get("main"))
+    brief += " 涨停 %s/跌停 %s" % (zt_n if zt_n is not None else "—",
+                                 dt_n if dt_n is not None else "—")
+    if len(brief) > 90:
+        brief = brief[:88] + "…"
+
+    return "\n".join(L), brief
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="docs")
@@ -2085,6 +2337,7 @@ def main():
     data["grade"], data["hit"] = grade, hit
 
     data = build_texts(data)
+    digest, brief = build_digest(data)
     print(f"[8/10] 定性：{headline}｜档位：{grade}（{hit}/4 到位）")
 
     out = args.out
@@ -2106,8 +2359,10 @@ def main():
         limits[0] if limits[0] is not None else "—",
         limits[1] if limits[1] is not None else "—")
     issues = [x for x in issues if x.get("date") != today]
+    for x in issues:
+        x.pop("digest", None)   # 老版本可能把正文写进来过，清掉
     issues.append({"date": today, "title": headline, "summary": summary,
-                   "path": f"archive/{today}.html"})
+                   "brief": brief, "path": f"archive/{today}.html"})
     issues.sort(key=lambda x: x["date"], reverse=True)
     issues = issues[:120]
     data["past"] = issues
@@ -2121,6 +2376,16 @@ def main():
 
     with open(issues_path, "w", encoding="utf-8") as f:
         json.dump(issues, f, ensure_ascii=False, indent=1)
+
+    # 推送正文单独落盘：里面可能带持仓，而 docs/ 是要公开到 Pages 的，
+    # 所以不能塞进 issues.json。push_payload.json 在仓库里被 gitignore 跳过。
+    try:
+        payload_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "push_payload.json")
+        with open(payload_path, "w", encoding="utf-8") as f:
+            json.dump({"date": today, "title": headline, "brief": brief,
+                       "digest": digest}, f, ensure_ascii=False, indent=1)
+    except Exception as e:  # noqa: BLE001
+        print("      ! 推送正文写入失败（不影响页面）：", e)
 
     # 活页那版：往期下拉要指向 GitHub Pages 的存档页。
     # 活页上没有 archive/ 目录，相对路径会被解析到站点根，点了一律 404；

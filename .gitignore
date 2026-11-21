@@ -11,3 +11,7 @@ Thumbs.db
 # 接口响应的当日缓存，纯本机调试用
 .cache/
 token.txt
+
+# 推送正文（可能含持仓），每天覆盖，绝不进仓库
+push_payload.json
+.tmpout/
