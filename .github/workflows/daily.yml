@@ -49,5 +49,5 @@ jobs:
           SERVERCHAN_URL: ${{ secrets.SERVERCHAN_URL }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           SITE_URL: ${{ vars.SITE_URL }}
-          LIVEPAGE_URL: ${{ vars.LIVEPAGE_URL }}   # 活页分享地址，推送里优先给这个
+          LIVEPAGE_URL: ${{ secrets.LIVEPAGE_URL }}   # 活页分享地址，推送里优先给这个
         run: python push.py
