@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 .DS_Store
 Thumbs.db
+
+# 接口响应的当日缓存，纯本机调试用
+.cache/

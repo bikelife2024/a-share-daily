@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 A股收盘复盘 · 云端生成器
-数据源：东方财富公开行情接口（无需任何密钥 / 账号）
+数据源：东方财富 / 腾讯 / 新浪的公开行情接口（无需任何密钥 / 账号）
 输出：docs/index.html、docs/archive/YYYY-MM-DD.html、docs/issues.json
 
 用法：
@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+import socket
 import urllib.request
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -107,21 +108,113 @@ SECTOR_ALIAS = {}
 
 
 # ── HTTP ───────────────────────────────────────────────────────
-def get_json(url, tries=4, timeout=25):
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# 优先走 IPv4：本机的 IPv6 出口到东财会被直接断连（curl -4 通、默认不通）。
+_ORIG_GAI = socket.getaddrinfo
+
+
+def _gai_ipv4_first(host, port, family=0, type=0, proto=0, flags=0):
+    if family in (0, socket.AF_UNSPEC):
+        try:
+            v4 = _ORIG_GAI(host, port, socket.AF_INET, type, proto, flags)
+            try:
+                v6 = _ORIG_GAI(host, port, socket.AF_INET6, type, proto, flags)
+            except socket.gaierror:
+                v6 = []
+            return v4 + v6
+        except socket.gaierror:
+            pass
+    return _ORIG_GAI(host, port, family, type, proto, flags)
+
+
+socket.getaddrinfo = _gai_ipv4_first
+
+
+_LAST_CALL = [0.0]
+_MIN_GAP = 4.0  # 全局最小请求间隔：实测东财每窗口只放行 ~6 个请求，慢一点更稳
+
+# 响应缓存：东财按"单位时间请求数"封禁，本地反复调试很容易撞线。
+# 同一个 URL 当天成功过就复用，重跑只看新增的请求。
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+_CACHE_ON = os.environ.get("NO_CACHE", "") in ("", "0", "false", "False")
+
+
+def _cache_path(url):
+    import hashlib
+    return os.path.join(_CACHE_DIR, hashlib.sha1(url.encode("utf-8")).hexdigest() + ".json")
+
+
+def get_json(url, tries=5, timeout=25, referer="https://quote.eastmoney.com/"):
+    """显式不走系统代理，带节流与当日缓存。
+
+    东财对代理出口 IP 有很重的限流，走代理会被整站断连；直连反而正常。
+    云端（Actions）本来没有代理，这些处理等于没写。
+    """
+    cp = _cache_path(url)
+    if _CACHE_ON and os.path.exists(cp):
+        try:
+            with open(cp, "r", encoding="utf-8") as f:
+                hit = json.load(f)
+            if (hit.get("day") == datetime.now(TZ).strftime("%Y-%m-%d")
+                    and hit.get("data") is not None):
+                return hit["data"]
+        except Exception:  # noqa: BLE001
+            pass
+
     last = None
     for i in range(tries):
+        gap = time.time() - _LAST_CALL[0]
+        if gap < _MIN_GAP:
+            time.sleep(_MIN_GAP - gap)
         try:
             req = urllib.request.Request(url, headers={
                 "User-Agent": UA,
-                "Referer": "https://quote.eastmoney.com/",
+                "Referer": referer,
                 "Accept": "*/*",
             })
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _OPENER.open(req, timeout=timeout) as r:
                 raw = r.read().decode("utf-8", "replace")
-            return json.loads(raw)
+            data = json.loads(raw)
+            if _CACHE_ON:
+                try:
+                    os.makedirs(_CACHE_DIR, exist_ok=True)
+                    with open(cp, "w", encoding="utf-8") as f:
+                        json.dump({"day": datetime.now(TZ).strftime("%Y-%m-%d"),
+                                   "url": url, "data": data}, f, ensure_ascii=False)
+                except Exception:  # noqa: BLE001
+                    pass
+            return data
         except Exception as e:  # noqa: BLE001
             last = e
-            time.sleep(0.8 * (i + 1))
+            # 被 WAF 断连时要歇久一点，短重试基本无效
+            time.sleep(15.0 * (i + 1))
+        finally:
+            _LAST_CALL[0] = time.time()
+    raise RuntimeError(f"请求失败 {url[:90]} → {last}")
+
+
+def get_text(url, referer="https://gu.qq.com/", encoding="utf-8",
+             tries=3, timeout=20):
+    """取纯文本（腾讯行情是 GBK，新浪也是）"""
+    last = None
+    for i in range(tries):
+        gap = time.time() - _LAST_CALL[0]
+        if gap < _MIN_GAP:
+            time.sleep(_MIN_GAP - gap)
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA,
+                "Referer": referer,
+                "Accept": "*/*",
+            })
+            with _OPENER.open(req, timeout=timeout) as r:
+                return r.read().decode(encoding, "replace")
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(2.0 * (i + 1))
+        finally:
+            _LAST_CALL[0] = time.time()
     raise RuntimeError(f"请求失败 {url[:90]} → {last}")
 
 
@@ -138,24 +231,185 @@ def num(v):
 
 
 # ── 采集 ───────────────────────────────────────────────────────
+# ── 备用数据源 ──────────────────────────────────────────────────
+# 东财 push2 域名对单个出口 IP 的限流极激进：连续几十次请求就会整域断连，
+# 指数、板块、涨跌家数、资金流全在这一个域名上，一封就什么都取不到。
+# 下面这组备用源只在主接口失败时启用——宁可某节降级，也不让整份报告出不来。
+QQ_SECID = {
+    "1.000001": "sh000001", "0.399001": "sz399001", "0.399006": "sz399006",
+    "1.000688": "sh000688", "1.000852": "sh000852", "0.899050": "bj899050",
+}
+QQ_SECTOR_FLOW = {}   # 走腾讯兜底时顺手拿到的行业主力净额（元）
+SECTOR_SOURCE = "东财行业板块指数（板块内等权）"
+BREADTH_SOURCE = "三市指数成分统计"
+
+
+def fetch_indices_qq():
+    """腾讯 qt.gtimg.cn：一次拿到全部指数的现价、涨跌、成交额"""
+    codes = [QQ_SECID.get(s) for s, _ in INDICES]
+    if not all(codes):
+        return []
+    txt = get_text("https://qt.gtimg.cn/q=" + ",".join(codes), encoding="gbk")
+    by = {}
+    for line in txt.strip().split("\n"):
+        if '="' not in line:
+            continue
+        key = line.split("=", 1)[0].replace("v_", "").strip()
+        parts = line.split('="', 1)[1].rstrip('";').split("~")
+        if len(parts) < 38:
+            continue
+        by[key] = {
+            "code": parts[2],
+            "name": parts[1],
+            "close": num(parts[3]),
+            "chg": num(parts[31]),
+            "pct": num(parts[32]),
+            "amount": (num(parts[37]) or 0.0) * 1e4,
+        }
+    out = []
+    for secid, label in INDICES:
+        r = by.get(QQ_SECID.get(secid))
+        if r and r["close"] is not None:
+            r = dict(r)
+            r["name"] = label
+            out.append(r)
+    return out
+
+
+def fetch_sectors_qq():
+    """腾讯行业板块排行：一次拿到 30+ 个一级行业的涨跌幅与主力净额
+
+    zdf 是板块涨跌幅，zljlr 是主力净流入（单位万元）。这两个字段正好
+    对上页面要的两个数，所以兜底时一次请求就够，不用再逐个查。
+    """
+    url = ("https://proxy.finance.qq.com/cgi/cgi-bin/rank/pt/getRank?board_type=hy"
+           "&sort_type=price&direct=down&offset=0&count=40&type=1")
+    j = get_json(url, referer="https://gu.qq.com/", tries=3, timeout=20)
+    rows = ((j.get("data") or {}).get("rank_list")) or []
+    names = {n for _c, n in SECTORS_L1}
+    out = []
+    for r in rows:
+        name = str(r.get("name") or "").strip()
+        pct = num(r.get("zdf"))
+        if name not in names or pct is None:
+            continue
+        out.append({"name": name, "pct": round(pct, 2), "n": 0, "amount": None})
+        v = num(r.get("zljlr"))
+        if v is not None:
+            QQ_SECTOR_FLOW[name] = v * 1e4
+    global SECTOR_SOURCE
+    SECTOR_SOURCE = "腾讯行业板块指数（腾讯口径，含汽车共 31 个一级行业）"
+    print("      （腾讯行业板块兜底，取到 %d / %d 个）" % (len(out), len(SECTORS_L1)))
+    out.sort(key=lambda x: -x["pct"])
+    return out
+
+
+def fetch_breadth_zdfb(date_str):
+    """涨跌家数兜底：东财涨跌分布（push2ex 域名，和 push2 不共用）
+
+    返回值是按整百分点分档的家数，正档加总=上涨、负档加总=下跌。
+    与精确的 f104/f105/f106 会有几十家的误差（分档取整导致），
+    但趋势完全一致，够用来判断情绪。
+    """
+    url = ("https://push2ex.eastmoney.com/getTopicZDFenBu"
+           "?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt&date=" + date_str)
+    j = get_json(url, tries=3, timeout=15)
+    items = (j.get("data") or {}).get("fenbu") or []
+    up = dn = flat = 0
+    for item in items:
+        for k, v in (item or {}).items():
+            try:
+                bucket = int(float(k))
+                cnt = int(v or 0)
+            except (TypeError, ValueError):
+                continue
+            if bucket > 0:
+                up += cnt
+            elif bucket < 0:
+                dn += cnt
+            else:
+                flat += cnt
+    return (up, dn, flat) if (up + dn) else None
+
+
+def fetch_overseas_sina():
+    """海外指数兜底：新浪（美股、港股直接给点位和涨跌幅）"""
+    sina = {
+        "100.DJIA": "int_dji", "100.NDX": "int_nasdaq", "100.SPX": "int_sp500",
+        "100.HSI": "rt_hkHSI", "100.N225": "int_nikkei",
+        "100.KS11": "znb_kospi", "100.TWII": "znb_twii",
+    }
+    keys = [sina[s] for s, _ in OVERSEAS if s in sina]
+    txt = get_text("https://hq.sinajs.cn/list=" + ",".join(keys),
+                   referer="https://finance.sina.com.cn", encoding="gbk")
+    by = {}
+    for line in txt.strip().split("\n"):
+        if '="' not in line:
+            continue
+        key = line.split("=", 1)[0].replace("var hq_str_", "").strip()
+        parts = line.split('="', 1)[1].rstrip('";').split(",")
+        by[key] = parts
+    out = []
+    for secid, label in OVERSEAS:
+        s = sina.get(secid)
+        p = by.get(s) if s else None
+        if not p or len(p) < 4:
+            continue
+        if s == "rt_hkHSI":
+            close, pct = num(p[6]), num(p[8])
+        else:
+            close, pct = num(p[1]), num(p[3])
+        if close is None:
+            continue
+        out.append({"name": label, "close": close, "pct": pct})
+    return out
+
+
+def fetch_kline_qq(secid, limit=140):
+    """K 线兜底：腾讯前复权日线"""
+    code = QQ_SECID.get(secid)
+    if not code:
+        return []
+    url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param="
+           "%s,day,,,%d,qfq" % (code, limit))
+    j = get_json(url, referer="https://gu.qq.com/", tries=3, timeout=20)
+    d = (j.get("data") or {}).get(code) or {}
+    rows = d.get("qfqday") or d.get("day") or []
+    out = []
+    for r in rows:
+        if len(r) < 3:
+            continue
+        c = num(r[2])
+        if c is None:
+            continue
+        out.append({"date": r[0], "close": c, "amount": None})
+    return out
+
+
 def fetch_indices():
     secids = ",".join(s for s, _ in INDICES)
     url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
            f"&secids={secids}&fields=f2,f3,f4,f6,f12,f14")
-    j = get_json(url)
-    by_code = {}
-    for row in j["data"]["diff"]:
-        by_code[row.get("f12")] = {
-            "code": row.get("f12"),
-            "name": row.get("f14"),
-            "close": num(row.get("f2")),
-            "pct": num(row.get("f3")),
-            "chg": num(row.get("f4")),
-            "amount": num(row.get("f6")),
-        }
-    # 按 INDICES 声明顺序输出，避免接口顺序变动导致取错
-    out = [by_code[c.split(".")[1]] for c, _ in INDICES if c.split(".")[1] in by_code]
-    return out
+    try:
+        j = get_json(url, tries=1, timeout=12)
+        by_code = {}
+        for row in (j.get("data") or {}).get("diff") or []:
+            by_code[row.get("f12")] = {
+                "code": row.get("f12"),
+                "name": row.get("f14"),
+                "close": num(row.get("f2")),
+                "pct": num(row.get("f3")),
+                "chg": num(row.get("f4")),
+                "amount": num(row.get("f6")),
+            }
+        # 按 INDICES 声明顺序输出，避免接口顺序变动导致取错
+        out = [by_code[c.split(".")[1]] for c, _ in INDICES if c.split(".")[1] in by_code]
+        if len(out) == len(INDICES):
+            return out
+    except Exception:  # noqa: BLE001
+        pass
+    print("      ! 东财指数接口不可用，改走腾讯")
+    return fetch_indices_qq()
 
 
 def fetch_all_a():
@@ -230,51 +484,71 @@ def fetch_all_a():
     return allrows, (total or len(allrows)), len(failed)
 
 
-def fetch_breadth_fast():
-    """全市场涨跌家数（备用路径）。
+def fetch_breadth_fast(date_str=None):
+    """全市场涨跌家数。
 
-    上证指数、深证综指、北证50 的成分股分别覆盖沪、深、北三市全部 A 股，
-    它们的 f104/f105/f106 就是各自市场的涨/跌/平家数，三项相加即全市场。
+    首选：上证指数、深证综指、北证50 的成分股分别覆盖沪、深、北三市全部 A 股，
+    它们的 f104/f105/f106 就是各自市场的涨/跌/平家数，三项相加即全市场，
     一次请求就能拿到，不必依赖全 A 分页。
+    兜底：东财涨跌分布（push2ex 域名），按整百分点分档汇总。
     """
     url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
            "&fields=f12,f14,f104,f105,f106"
            "&secids=1.000001,0.399106,0.899050")
-    j = get_json(url)
-    up = dn = flat = 0
-    got = False
-    for d in (j.get("data") or {}).get("diff") or []:
-        a, b, c = num(d.get("f104")), num(d.get("f105")), num(d.get("f106"))
-        if a is None and b is None:
-            continue
-        got = True
-        up += int(a or 0)
-        dn += int(b or 0)
-        flat += int(c or 0)
-    return (up, dn, flat) if got else None
+    try:
+        j = get_json(url, tries=1, timeout=12)
+        up = dn = flat = 0
+        got = False
+        for d in (j.get("data") or {}).get("diff") or []:
+            a, b, c = num(d.get("f104")), num(d.get("f105")), num(d.get("f106"))
+            if a is None and b is None:
+                continue
+            got = True
+            up += int(a or 0)
+            dn += int(b or 0)
+            flat += int(c or 0)
+        if got:
+            return (up, dn, flat)
+    except Exception:  # noqa: BLE001
+        pass
+    if date_str:
+        try:
+            r = fetch_breadth_zdfb(date_str)
+            if r:
+                global BREADTH_SOURCE
+                BREADTH_SOURCE = "东财涨跌分布（±整百分点分档汇总）"
+                print("      （涨跌家数改走涨跌分布，按整百分点分档汇总）")
+                return r
+        except Exception:  # noqa: BLE001
+            pass
+    return None
 
 
 def fetch_sector_boards():
     """申万一级行业的涨跌幅，走 ulist 按 BK 代码批量取。
 
     分两批发（15 个一批），每批一次请求。ulist 这个接口在云端 IP 上验证过很稳
-    （连发 8 次全成功），比 clist 分页可靠得多。
+    （连发 8 次全成功），比 clist 分页可靠得多。被封时退到腾讯行业排行。
     """
     got = {}
-    for i in range(0, len(SECTORS_L1), 15):
-        chunk = SECTORS_L1[i:i + 15]
-        secids = ",".join("90." + c for c, _ in chunk)
-        url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
-               "&fields=f2,f3,f6,f12,f14&secids=" + secids)
-        j = get_json(url, tries=4, timeout=15)
-        for r in (j.get("data") or {}).get("diff") or []:
-            code = str(r.get("f12") or "").strip()
-            pct = num(r.get("f3"))
-            if code and pct is not None:
-                got[code] = (pct, num(r.get("f6")))
+    try:
+        for i in range(0, len(SECTORS_L1), 15):
+            chunk = SECTORS_L1[i:i + 15]
+            secids = ",".join("90." + c for c, _ in chunk)
+            url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
+                   "&fields=f2,f3,f6,f12,f14&secids=" + secids)
+            j = get_json(url, tries=1, timeout=12)
+            for r in (j.get("data") or {}).get("diff") or []:
+                code = str(r.get("f12") or "").strip()
+                pct = num(r.get("f3"))
+                if code and pct is not None:
+                    got[code] = (pct, num(r.get("f6")))
+    except Exception:  # noqa: BLE001
+        got = {}
 
-    if not got:
-        return []
+    if len(got) < 20:
+        print("      ! 东财板块接口不可用，改走腾讯")
+        return fetch_sectors_qq()
 
     out = []
     for code, name in SECTORS_L1:
@@ -369,18 +643,24 @@ def fetch_kline(secid, limit=140):
     url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
            f"?secid={secid}&fields1=f1,f2&fields2=f51,f53,f57&klt=101&fqt=1"
            f"&end=20500101&lmt={limit}")
-    j = get_json(url)
-    k = ((j.get("data") or {}).get("klines")) or []
     out = []
-    for line in k:
-        parts = line.split(",")
-        if len(parts) < 2:
-            continue
-        c = num(parts[1])
-        if c is None:
-            continue
-        amt = num(parts[2]) if len(parts) > 2 else None
-        out.append({"date": parts[0], "close": c, "amount": amt})
+    try:
+        j = get_json(url, tries=1, timeout=12)
+        k = ((j.get("data") or {}).get("klines")) or []
+        for line in k:
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            c = num(parts[1])
+            if c is None:
+                continue
+            amt = num(parts[2]) if len(parts) > 2 else None
+            out.append({"date": parts[0], "close": c, "amount": amt})
+    except Exception:  # noqa: BLE001
+        out = []
+    if not out:
+        print("      ! 东财 K 线不可用，改走腾讯")
+        out = fetch_kline_qq(secid, limit)
     return out
 
 
@@ -390,7 +670,11 @@ def fetch_holdings():
     secids = ",".join(s for s, _, _ in HOLDINGS)
     url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
            f"&secids={secids}&fields=f2,f3,f6,f8,f10,f12,f14")
-    j = get_json(url)
+    j = None
+    try:
+        j = get_json(url, tries=1, timeout=12)
+    except Exception:  # noqa: BLE001
+        return []
     by_code = {}
     for row in (j.get("data") or {}).get("diff") or []:
         by_code[row.get("f12")] = row
@@ -413,13 +697,266 @@ def fetch_overseas():
     secids = ",".join(s for s, _ in OVERSEAS)
     url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
            f"&secids={secids}&fields=f2,f3,f12,f14")
-    j = get_json(url)
-    order = {s: i for i, (s, _) in enumerate(OVERSEAS)}
-    rows = j["data"]["diff"]
-    rows.sort(key=lambda r: order.get("100." + str(r.get("f12")), 99))
-    out = []
+    try:
+        j = get_json(url, tries=1, timeout=12)
+        order = {s: i for i, (s, _) in enumerate(OVERSEAS)}
+        rows = (j.get("data") or {}).get("diff") or []
+        rows.sort(key=lambda r: order.get("100." + str(r.get("f12")), 99))
+        out = []
+        for r in rows:
+            out.append({"name": r.get("f14"), "close": num(r.get("f2")),
+                        "pct": num(r.get("f3"))})
+        if len(out) >= 4:
+            return out
+    except Exception:  # noqa: BLE001
+        pass
+    print("      ! 东财海外接口不可用，改走新浪")
+    return fetch_overseas_sina()
+
+
+# ── 资金流向 ────────────────────────────────────────────────────
+# 东财 fflow/kline：分钟级资金流，最后一条（15:00）就是全天累计。
+# 字段顺序：f51 时间, f52 主力, f53 小单, f54 中单, f55 大单, f56 超大单；
+# 恒等式：主力 = 大单 + 超大单；四档相加 = 0（有人买必有人卖）。
+def _flow_parse(kline):
+    p = kline.split(",")
+    if len(p) < 6:
+        return None
+    return {
+        "time": p[0],
+        "main": num(p[1]) or 0.0,
+        "sm": num(p[2]) or 0.0,
+        "md": num(p[3]) or 0.0,
+        "lg": num(p[4]) or 0.0,
+        "xl": num(p[5]) or 0.0,
+    }
+
+
+def fetch_flow_one(secid="1.000001", secid2=None, tries=1, timeout=12):
+    """单个标的的当日资金流（全天累计）"""
+    url = ("https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+           "?lmt=0&klt=1&secid=" + secid + (("&secid2=" + secid2) if secid2 else "")
+           + "&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56")
+    j = get_json(url, tries=tries, timeout=timeout)
+    k = (j.get("data") or {}).get("klines") or []
+    return _flow_parse(k[-1]) if k else None
+
+
+def fetch_flow():
+    """大盘资金流：沪 + 深分开取，再合并。
+
+    分钟接口允许传 secid2 一次拿两市合计，但分市场拆开看更有用
+    （能看出是沪市失血还是深市失血），所以取两次自己加。
+    push2 被限流时改从 push2his 取（两个域名是分开限的）。
+    """
+    def _one(secid):
+        try:
+            return fetch_flow_one(secid)
+        except Exception:  # noqa: BLE001
+            return None
+
+    sh, sz = _one("1.000001"), _one("0.399001")
+    if not sh and not sz:
+        print("      ! 东财分钟资金流不可用，改走 push2his 日线")
+        return fetch_flow_his()
+    sh = sh or {k: 0.0 for k in ("main", "sm", "md", "lg", "xl")}
+    sz = sz or {k: 0.0 for k in ("main", "sm", "md", "lg", "xl")}
+    tot = {k: sh[k] + sz[k] for k in ("main", "sm", "md", "lg", "xl")}
+    tot["sh"] = sh
+    tot["sz"] = sz
+    return tot
+
+
+def fetch_flow_his():
+    """资金流兜底：push2his 上的分钟资金流，最后一条即收盘全天累计"""
+    def one(secid):
+        url = ("https://push2his.eastmoney.com/api/qt/stock/fflow/kline/get"
+               "?lmt=0&klt=1&secid=" + secid
+               + "&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56")
+        j = get_json(url, tries=2, timeout=15)
+        k = (j.get("data") or {}).get("klines") or []
+        return _flow_parse(k[-1]) if k else None
+
+    sh = sz = None
+    for secid, tag in (("1.000001", "sh"), ("0.399001", "sz")):
+        try:
+            v = one(secid)
+        except Exception:  # noqa: BLE001
+            v = None
+        if tag == "sh":
+            sh = v
+        else:
+            sz = v
+    if not sh and not sz:
+        return None
+    sh = sh or {k: 0.0 for k in ("main", "sm", "md", "lg", "xl")}
+    sz = sz or {k: 0.0 for k in ("main", "sm", "md", "lg", "xl")}
+    tot = {k: sh[k] + sz[k] for k in ("main", "sm", "md", "lg", "xl")}
+    tot["sh"] = sh
+    tot["sz"] = sz
+    return tot
+
+
+def fetch_sector_flow(sectors):
+    """各行业板块的当日主力净额。
+
+    首选 ulist 批量带 f62（2 次请求）。该接口在云端或高频访问下会被断连，
+    退路是逐个走 fflow/kline —— 但 30 个板块逐个查在限流时能拖到几分钟，
+    所以退路只查涨跌幅两端的 8 个（正是"异动板块"要看的那几个），
+    单次超时压到 8 秒、不重试，宁可少几个也不把工作流拖超时。
+
+    返回 (dict 名称→净额, 口径说明)。
+    """
+    codes = [c for c, _ in SECTORS_L1]
+    name_of = dict(SECTORS_L1)
+    got = {}
+
+    # 路径零：板块兜底时顺手拿到的腾讯主力净额（一次请求覆盖全部行业）
+    if QQ_SECTOR_FLOW:
+        return dict(QQ_SECTOR_FLOW), "全部 %d 个行业" % len(QQ_SECTOR_FLOW)
+
+    # 路径一：ulist 批量
+    try:
+        for i in range(0, len(codes), 15):
+            chunk = codes[i:i + 15]
+            secids = ",".join("90." + c for c in chunk)
+            url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
+                   "&fields=f12,f14,f62,f184&secids=" + secids)
+            j = get_json(url, tries=1, timeout=12)
+            for r in (j.get("data") or {}).get("diff") or []:
+                code = str(r.get("f12") or "").strip()
+                v = num(r.get("f62"))
+                if code in name_of and v is not None:
+                    got[name_of[code]] = v
+    except Exception:  # noqa: BLE001
+        got = {}
+
+    if len(got) >= len(codes) - 3:
+        return got, "全部 %d 个行业" % len(got)
+
+    # 路径二：只查涨跌幅两端
+    got = {}
+    picked = []
+    if sectors:
+        for s in sectors[:4] + sectors[-4:]:
+            code = next((c for c, n in SECTORS_L1 if n == s["name"]), None)
+            if code and code not in picked:
+                picked.append(code)
+    else:
+        picked = codes[:8]
+    for code in picked:
+        try:
+            f = fetch_flow_one("90." + code, tries=1, timeout=8)
+            if f:
+                got[name_of[code]] = f["main"]
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.4)
+    print("      （板块资金流走逐个查询，拿到 %d 个）" % len(got))
+    return got, "涨跌幅两端 %d 个行业" % len(got)
+
+
+# ── 异动个股：涨停池 / 跌停池 / 炸板池 / 龙虎榜 ──────────────────
+def _pool(kind, date_str, pagesize, sort):
+    url = ("https://push2ex.eastmoney.com/getTopic" + kind + "Pool"
+           "?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt&Pageindex=0"
+           f"&pagesize={pagesize}&sort={sort}&date={date_str}")
+    j = get_json(url, tries=2, timeout=15)
+    d = j.get("data") or {}
+    return d.get("pool") or [], int(d.get("tc") or 0)
+
+
+def _pct_of(v, base=1000.0):
+    """池子里的价格是放大 1000 倍的整数"""
+    return (v / base) if v is not None else None
+
+
+def fetch_limit_pools(date_str):
+    """涨停、跌停、炸板三个池子。
+
+    这三个池子是判断情绪最直接的窗口：
+    涨停家数看赚钱效应，跌停家数看亏钱效应，炸板率看承接力。
+    """
+    out = {"zt": [], "dt": [], "zb": [], "zt_n": 0, "dt_n": 0, "zb_n": 0}
+    try:
+        rows, tc = _pool("ZT", date_str, 90, "lbc%3Adesc")
+        out["zt_n"] = tc or len(rows)
+        for r in rows:
+            out["zt"].append({
+                "code": str(r.get("c") or ""),
+                "name": r.get("n") or "",
+                "pct": round(num(r.get("zdp")) or 0, 2),
+                "close": _pct_of(num(r.get("p"))),
+                "amount": num(r.get("amount")),
+                "turnover": num(r.get("hs")),
+                "boards": int(num(r.get("lbc")) or 1),
+                "fund": num(r.get("fund")),
+                "fbt": str(r.get("fbt") or "").zfill(6),
+                "sector": r.get("hybk") or "",
+            })
+    except Exception as e:  # noqa: BLE001
+        print("      ! 涨停池失败：", e)
+
+    try:
+        rows, tc = _pool("DT", date_str, 30, "fund%3Aasc")
+        out["dt_n"] = tc or len(rows)
+        for r in rows:
+            out["dt"].append({
+                "code": str(r.get("c") or ""),
+                "name": r.get("n") or "",
+                "pct": round(num(r.get("zdp")) or 0, 2),
+                "amount": num(r.get("amount")),
+                "fund": num(r.get("fund")),
+                "turnover": num(r.get("hs")),
+            })
+    except Exception as e:  # noqa: BLE001
+        print("      ! 跌停池失败：", e)
+
+    try:
+        rows, tc = _pool("ZB", date_str, 30, "zbc%3Adesc")
+        out["zb_n"] = tc or len(rows)
+        for r in rows:
+            out["zb"].append({
+                "code": str(r.get("c") or ""),
+                "name": r.get("n") or "",
+                "pct": round(num(r.get("zdp")) or 0, 2),
+                "amount": num(r.get("amount")),
+                "turnover": num(r.get("hs")),
+                "open": int(num(r.get("zbc")) or 1),
+            })
+    except Exception as e:  # noqa: BLE001
+        print("      ! 炸板池失败：", e)
+    return out
+
+
+def fetch_lhb(date_str):
+    """龙虎榜：当日净买入额排行（按个股去重，取净买入最大那条）"""
+    url = ("https://datacenter-web.eastmoney.com/api/data/v1/get"
+           "?reportName=RPT_DAILYBILLBOARD_DETAILSNEW&columns=ALL&pageNumber=1"
+           "&pageSize=60&sortColumns=BILLBOARD_NET_AMT&sortTypes=-1&source=WEB&client=WEB"
+           "&filter=(TRADE_DATE%3D%27" + date_str + "%27)")
+    try:
+        j = get_json(url, tries=2, timeout=15)
+        rows = (j.get("result") or {}).get("data") or []
+    except Exception as e:  # noqa: BLE001
+        print("      ! 龙虎榜失败：", e)
+        return []
+    seen, out = set(), []
     for r in rows:
-        out.append({"name": r.get("f14"), "close": num(r.get("f2")), "pct": num(r.get("f3"))})
+        code = str(r.get("SECURITY_CODE") or "")
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        out.append({
+            "code": code,
+            "name": r.get("SECURITY_NAME_ABBR") or "",
+            "pct": num(r.get("CHANGE_RATE")),
+            "net": num(r.get("BILLBOARD_NET_AMT")),
+            "buy": num(r.get("BILLBOARD_BUY_AMT")),
+            "sell": num(r.get("BILLBOARD_SELL_AMT")),
+            "turnover": num(r.get("TURNOVERRATE")),
+            "reason": (r.get("EXPLANATION") or "").strip(),
+        })
     return out
 
 
@@ -467,6 +1004,8 @@ def cls(pct):
 def spct(pct, digits=2):
     if pct is None:
         return "—"
+    if abs(pct) < 0.5 * 10 ** (-digits):
+        pct = 0.0          # 避免出现 -0.00%
     return f"{pct:+.{digits}f}%"
 
 
@@ -640,11 +1179,39 @@ ul{margin:8px 0 8px 20px;} li{margin:5px 0; color:var(--ink2); font-size:13px;}
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
 .disc{margin-top:46px; padding-top:14px; border-top:1px solid var(--line);
   font-size:11.5px; color:var(--ink3); line-height:1.75;}
+/* 资金流分叉条 */
+.flow{background:var(--card); border:1px solid var(--line); padding:14px 15px; margin:12px 0;}
+.flowrow{display:grid; grid-template-columns:56px 1fr 88px; gap:10px; align-items:center;
+  margin:7px 0; font-size:12.5px;}
+.flowrow .fl{color:var(--ink3); font-size:11.5px; text-align:left;}
+.flowrow .fv{text-align:right; font-variant-numeric:tabular-nums; font-weight:600;}
+.fbar{position:relative; height:16px; background:#f1f0ed; border-radius:2px;}
+.fbar .z{position:absolute; left:50%; top:0; bottom:0; width:1px; background:#cfcdc7;}
+.fbar i{position:absolute; top:2.5px; bottom:2.5px; border-radius:1.5px;}
+.flow .foot{font-size:11px; color:var(--ink3); margin-top:10px; line-height:1.65;
+  padding-top:9px; border-top:1px dashed var(--line);}
+/* 两栏对照 */
+.pair{display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:12px 0;}
+.pair .col{min-width:0;}
+.pair .col .t{font-size:11.5px; color:var(--ink3); margin-bottom:6px; padding-left:2px;}
+.pair table{margin:0; font-size:12.3px;}
+.pair th,.pair td{padding:6px 8px;}
+.tag-mini{display:inline-block; font-size:10px; padding:0 5px; border-radius:2px;
+  background:#f1f0ed; color:var(--ink3); margin-left:4px; vertical-align:1px;}
+.tag-mini.hot{background:#fbeceb; color:var(--up);}
+.tag-mini.cold{background:#e8f3ee; color:var(--down);}
+.pool{display:grid; grid-template-columns:repeat(4,1fr); gap:9px; margin:12px 0;}
+.pool .p{background:var(--card); border:1px solid var(--line); padding:11px 12px;}
+.pool .p .k{font-size:11px; color:var(--ink3);}
+.pool .p .v{font-size:18px; font-weight:700; margin-top:3px;}
+.pool .p .s{font-size:10.5px; color:var(--ink3); margin-top:2px;}
 @media (max-width:640px){
   h1{font-size:21px;} .cards{grid-template-columns:repeat(2,1fr);}
   .chain{grid-template-columns:1fr;} .arrow{transform:rotate(90deg); padding:6px 0;}
   .anchors{grid-template-columns:1fr;} table{font-size:12px;}
   th,td{padding:7px 7px;}
+  .pair{grid-template-columns:1fr;} .pool{grid-template-columns:repeat(2,1fr);}
+  .flowrow{grid-template-columns:48px 1fr 76px; gap:7px;}
 }
 """
 
@@ -797,6 +1364,160 @@ def render(data):
                      f'<td class="{cls(s["pct"])}">{spct(s["pct"])}</td>'
                      f'<td>{s["n"] or "—"}</td></tr>')
 
+    # —— 资金流向
+    flow = data.get("flow") or {}
+    flow_sec = data.get("flow_sectors") or {}
+    flow_src = data.get("flow_src") or ""
+    flow_html = ""
+    flow_text = ""
+    if flow:
+        items = [("主力净额", flow.get("main")), ("超大单", flow.get("xl")),
+                 ("大单", flow.get("lg")), ("中单", flow.get("md")), ("小单", flow.get("sm"))]
+        mx = max([abs(v or 0) for _, v in items] + [1e8])
+        frows = ""
+        for label, v in items:
+            v = v or 0
+            w = abs(v) / mx * 50
+            side = "left:50%" if v >= 0 else "right:50%"
+            frows += ('<div class="flowrow"><span class="fl">%s</span>'
+                      '<span class="fbar"><i class="z"></i>'
+                      '<i style="%s;width:%.1f%%;background:%s"></i></span>'
+                      '<span class="fv %s">%+.2f 亿</span></div>'
+                      % (label, side, w, "var(--up)" if v >= 0 else "var(--down)",
+                         cls(v), v / 1e8))
+        shm = (flow.get("sh") or {}).get("main") or 0
+        szm = (flow.get("sz") or {}).get("main") or 0
+        flow_html = ('<div class="flow">' + frows
+                     + '<div class="foot">沪市主力 <b class="%s">%+.2f 亿</b>　·　'
+                       '深市主力 <b class="%s">%+.2f 亿</b>　·　'
+                       '口径：超大单指单笔 ≥100 万元，大单 20–100 万元，中单 4–20 万元，小单 &lt;4 万元。'
+                       '主力 = 超大单 + 大单。</div></div>'
+                       % (cls(shm), shm / 1e8, cls(szm), szm / 1e8))
+
+        # 钱从哪来到哪去
+        inflow = sorted([(n, v) for n, v in flow_sec.items() if v > 0], key=lambda x: -x[1])
+        outflow = sorted([(n, v) for n, v in flow_sec.items() if v < 0], key=lambda x: x[1])
+
+        def flow_tbl(rows, empty="没有净流入的行业"):
+            if not rows:
+                return '<tr><td colspan="2" style="text-align:center;color:#8d8a83">%s</td></tr>' % empty
+            return "".join('<tr><td>%s</td><td class="%s">%+.1f 亿</td></tr>'
+                           % (n, cls(v), v / 1e8) for n, v in rows[:5])
+
+        if flow_sec:
+            pair_tbl = ('<div class="pair">'
+                        '<div class="col"><div class="t">主力净流入 · %s</div>'
+                        '<div class="tbl-wrap"><table><thead><tr><th>行业</th><th>净额</th></tr></thead>'
+                        '<tbody>%s</tbody></table></div></div>'
+                        '<div class="col"><div class="t">主力净流出 · %s</div>'
+                        '<div class="tbl-wrap"><table><thead><tr><th>行业</th><th>净额</th></tr></thead>'
+                        '<tbody>%s</tbody></table></div></div></div>'
+                        % (flow_src, flow_tbl(inflow, "全部行业净流出"),
+                           flow_src, flow_tbl(outflow, "全部行业净流入")))
+            flow_html += pair_tbl
+
+        main_yi = (flow.get("main") or 0) / 1e8
+        sm_yi = (flow.get("sm") or 0) / 1e8
+        if main_yi < 0 and sm_yi > 0:
+            flow_text = ("主力全天净流出 <strong>%.0f 亿</strong>，小单净流入 <strong>%.0f 亿</strong>——"
+                         "机构在卖，散户在接。这种结构在下跌途中反复出现，意味着抛压是从大资金那头出来的，"
+                         "不是散户恐慌砸盘；也意味着只要大资金不再卖，指数就能稳住，但反之反弹也容易被再卖一次。"
+                         % (abs(main_yi), sm_yi))
+        elif main_yi > 0 and sm_yi < 0:
+            flow_text = ("主力全天净流入 <strong>%.0f 亿</strong>，小单净流出 <strong>%.0f 亿</strong>——"
+                         "大资金在买、散户在卖，是筹码由散转集中 的结构，通常比指数涨跌本身更值得关注。"
+                         % (main_yi, abs(sm_yi)))
+        else:
+            flow_text = ("主力全天净额 <strong>%+.0f 亿</strong>，四档资金流向没有形成明显对倒结构，"
+                         "说明当天多空双方力量接近，方向更多由板块轮动而非整体资金进出决定。"
+                         % main_yi)
+        if flow_sec and outflow:
+            n0, v0 = outflow[0]
+            word = "失血最重" if flow_src.startswith("全部") else "这批行业里失血最重"
+            flow_text += ("行业层面%s的是 <strong>%s（%+.0f 亿）</strong>%s。"
+                          % (word, n0, v0 / 1e8,
+                             ("，净流入居前的是 <strong>%s（%+.0f 亿）</strong>" % (inflow[0][0], inflow[0][1] / 1e8))
+                             if inflow else ""))
+
+    # —— 异动板块：涨跌幅两端
+    hot = sectors[:5] if sectors else []
+    cold = sectors[-5:][::-1] if sectors else []
+    # 全市场普跌时最强的那个也是负的，叫"领涨"不准确，换成"相对最强"
+    up_word = "领涨" if (hot and hot[0]["pct"] > 0) else "相对最强"
+    dn_word = "领跌" if (cold and cold[0]["pct"] < 0) else "相对最弱"
+
+    def sec_rows(rows):
+        return "".join('<tr><td>%s</td><td class="%s">%s</td></tr>'
+                       % (s["name"], cls(s["pct"]), spct(s["pct"])) for s in rows)
+
+    anomaly_sec_html = (
+        '<div class="pair">'
+        '<div class="col"><div class="t">%s（前 5）</div>'
+        '<div class="tbl-wrap"><table><thead><tr><th>行业</th><th>涨跌幅</th></tr></thead>'
+        '<tbody>%s</tbody></table></div></div>'
+        '<div class="col"><div class="t">%s（后 5）</div>'
+        '<div class="tbl-wrap"><table><thead><tr><th>行业</th><th>涨跌幅</th></tr></thead>'
+        '<tbody>%s</tbody></table></div></div></div>'
+        % (up_word, sec_rows(hot), dn_word, sec_rows(cold)))
+
+    # —— 异动个股
+    lp = data.get("pools") or {}
+    zt_rows = lp.get("zt") or []
+    dt_rows = lp.get("dt") or []
+    zb_rows = lp.get("zb") or []
+    lhb = data.get("lhb") or []
+    zt_n = lp.get("zt_n") or 0
+    dt_n = lp.get("dt_n") or 0
+    zb_n = lp.get("zb_n") or 0
+    open_rate = (zb_n / (zt_n + zb_n) * 100) if (zt_n + zb_n) else None
+
+    def fmt_t(v):
+        s = str(v or "").zfill(6)
+        return "%s:%s" % (s[:2], s[2:4]) if len(s) == 6 and s != "000000" else "—"
+
+    lianban = sorted([x for x in zt_rows if x["boards"] >= 2],
+                     key=lambda x: (-x["boards"], -(x["fund"] or 0)))
+    # 连板股通常只有几只，补上封单最大的首板，凑够 10 行才好读
+    first_boards = sorted([x for x in zt_rows if x["boards"] < 2],
+                          key=lambda x: -(x["fund"] or 0))
+    zt_show = (lianban + first_boards)[:10]
+    zt_tbl_rows = ""
+    for x in zt_show:
+        tag_txt = ("%d板" % x["boards"]) if x["boards"] >= 2 else "首板"
+        tag_cls = "tag-mini hot" if x["boards"] >= 2 else "tag-mini"
+        zt_tbl_rows += ('<tr><td>%s<span class="%s">%s</span></td>'
+                        '<td class="%s">%s</td><td>%.2f 亿</td><td>%.2f%%</td>'
+                        '<td>%s</td><td style="text-align:left;color:#8d8a83;font-size:11px;'
+                        'white-space:normal;line-height:1.35">%s</td></tr>'
+                        % (x["name"], tag_cls, tag_txt, cls(x["pct"]), spct(x["pct"]),
+                           (x["fund"] or 0) / 1e8, x["turnover"] or 0,
+                           fmt_t(x["fbt"]), x["sector"] or "—"))
+    if not zt_tbl_rows:
+        zt_tbl_rows = '<tr><td colspan="6" style="text-align:center;color:#8d8a83">今日无涨停</td></tr>'
+
+    lhb_tbl_rows = "".join('<tr><td>%s</td><td class="%s">%s</td><td class="%s">%+.2f 亿</td></tr>'
+                           % (x["name"], cls(x["pct"]), spct(x["pct"]),
+                              cls(x["net"]), (x["net"] or 0) / 1e8)
+                           for x in lhb[:8])
+    if not lhb_tbl_rows:
+        lhb_tbl_rows = '<tr><td colspan="3" style="text-align:center;color:#8d8a83">龙虎榜尚未公布</td></tr>'
+
+    dt_tbl_rows = "".join('<tr><td>%s</td><td class="%s">%s</td><td>%s</td></tr>'
+                          % (x["name"], cls(x["pct"]), spct(x["pct"]),
+                             ("%.1f 万股" % ((x["fund"] or 0) / 1e4)) if x["fund"] else "—")
+                          for x in dt_rows[:8])
+    if not dt_tbl_rows:
+        dt_tbl_rows = '<tr><td colspan="3" style="text-align:center;color:#8d8a83">今日无跌停</td></tr>'
+
+    pool_cards = ('<div class="pool">'
+                  '<div class="p"><div class="k">涨停</div><div class="v up">%d</div><div class="s">封住涨停的家数</div></div>'
+                  '<div class="p"><div class="k">跌停</div><div class="v down">%d</div><div class="s">封死跌停的家数</div></div>'
+                  '<div class="p"><div class="k">炸板</div><div class="v">%d</div><div class="s">涨停被打开的家数</div></div>'
+                  '<div class="p"><div class="k">炸板率</div><div class="v">%s</div><div class="s">炸板 / (涨停+炸板)</div></div>'
+                  '</div>'
+                  % (zt_n, dt_n, zb_n,
+                     ("%.0f%%" % open_rate) if open_rate is not None else "—"))
+
     # —— 海外行
     rows_os = ""
     for o in overseas:
@@ -829,7 +1550,7 @@ def render(data):
 
     # 持仓节：发布到公开站点时用 SHOW_HOLDINGS=0 关掉，节编号跟着顺延
     if SHOW_HOLDINGS:
-        hold_section = ('<h2>七、持仓跟踪</h2>\n'
+        hold_section = ('<h2>十、持仓跟踪</h2>\n'
                         '<div class="tbl-wrap"><table>\n'
                         '<thead><tr><th>股票</th><th>收盘</th><th>涨跌幅</th><th>成交额</th>'
                         '<th>换手</th><th>量比</th><th>相对上证</th></tr></thead>\n'
@@ -837,10 +1558,10 @@ def render(data):
                         '<p>' + (data.get("holding_text") or "") + '</p>\n'
                         '<div class="note">只跟踪当日强弱，不用历史记录中的成本价推算盈亏'
                         '——若期间发生除权，旧成本会失效。需要判断止盈止损时，先核对复权后再定基准。</div>\n')
-        watch_no = "八"
+        watch_no = "十一"
     else:
         hold_section = ""
-        watch_no = "七"
+        watch_no = "十"
 
     # —— 锚
     anchor_html = ""
@@ -933,7 +1654,7 @@ def render(data):
 <header>
   <div class="kicker">A 股收盘复盘</div>
   <h1>{headline}</h1>
-  <div class="sub">{date_cn} · 收盘后 · 数据源：东方财富公开行情接口 · 生成时点 {data["gen_at"]}</div>
+  <div class="sub">{date_cn} · 收盘后 · 数据源：东方财富 / 腾讯 / 新浪公开接口 · 生成时点 {data["gen_at"]}</div>
 </header>
 
 <div class="past-bar" id="pastBar" hidden>
@@ -952,21 +1673,48 @@ def render(data):
 <thead><tr><th>指数</th><th>收盘</th><th>涨跌幅</th><th>涨跌点</th><th>成交额</th></tr></thead>
 <tbody>{rows_idx}</tbody></table></div>
 <div class="chartbox"><div id="chartIndex" class="chart" style="height:250px;"></div>
-<div class="cap">指数涨跌幅（%），红涨绿跌。数据源：东方财富，{data["gen_at"]}。</div></div>
+<div class="cap">指数涨跌幅（%），红涨绿跌。数据源：东方财富 / 腾讯，{data["gen_at"]}。</div></div>
 
 <h2>二、盘面质感</h2>
 <p>{data["texture"]}</p>
 
 <h2>三、板块强弱</h2>
 <div class="chartbox"><div id="chartSector" class="chart" style="height:560px;"></div>
-<div class="cap">固定跟踪的 30 个申万一级行业（东方财富板块指数），<strong>{data["sector_src"]}</strong>，自下而上由弱到强。
-口径提示：历史几期用的是申万分类，从本期起统一为东财分类以便与公开接口对齐，数值会与旧报告存在小幅口径差。</div></div>
+<div class="cap">固定跟踪的 30 个一级行业，数据源：<strong>{data["sector_src"]}</strong>，自下而上由弱到强。
+口径提示：板块指数由各自平台的板块编制方式计算，与「全 A 总市值加权」不是一回事，银行这类大小票分化的板块会被拉平，读的时候要记住这一点。</div></div>
 <div class="tbl-wrap"><table>
 <thead><tr><th>行业</th><th>涨跌幅</th><th>成分股数</th></tr></thead>
 <tbody>{rows_sec}</tbody></table></div>
 <p>{data["sector_text"]}</p>
 
-<h2>四、外围与杠杆：三层传导</h2>
+<h2>四、今日资金流向</h2>
+{flow_html}
+<p>{flow_text}</p>
+
+<h2>五、异动板块</h2>
+{anomaly_sec_html}
+<p>{data["anomaly_sec_text"]}</p>
+
+<h2>六、异动个股</h2>
+{pool_cards}
+<h3>涨停梯队（连板优先）</h3>
+<div class="tbl-wrap"><table>
+<thead><tr><th>股票</th><th>涨跌幅</th><th>封单</th><th>换手</th><th>首封</th><th style="text-align:left">所属板块</th></tr></thead>
+<tbody>{zt_tbl_rows}</tbody></table></div>
+<div class="pair">
+<div class="col"><div class="t">跌停（封单从少到多）</div>
+<div class="tbl-wrap"><table><thead><tr><th>股票</th><th>涨跌幅</th><th>封单量</th></tr></thead>
+<tbody>{dt_tbl_rows}</tbody></table></div></div>
+<div class="col"><div class="t">龙虎榜净买入（前 8）</div>
+<div class="tbl-wrap"><table><thead><tr><th>股票</th><th>涨跌幅</th><th>净买入</th></tr></thead>
+<tbody>{lhb_tbl_rows}</tbody></table></div></div>
+</div>
+<p>{data["anomaly_stock_text"]}</p>
+<div class="note">涨停 / 跌停 / 炸板家数取东方财富涨停池、跌停池、炸板池；龙虎榜取东方财富数据中心当日明细，
+同一只股票多条上榜原因只保留净买入最大的一条。封单额是收盘时未成交的委托金额；
+跌停池接口给的是封单<strong>量</strong>（股），所以跌停表按"万股"显示，两者不是同一个口径。</div>
+
+<h2>七、外围与杠杆：三层传导</h2>
 <div class="chain">
   <div class="box"><div class="t">① 海外</div><div class="b">{us_line}<br>{asia_line}</div></div>
   <div class="arrow">→</div>
@@ -982,14 +1730,14 @@ def render(data):
 数据源：东方财富数据中心，取最近已公布的交易日。</div></div>
 <p>{data["chain_text"]}</p>
 
-<h2>五、位置坐标</h2>
+<h2>八、位置坐标</h2>
 <div class="tbl-wrap"><table>
 <thead><tr><th>指数</th><th>收盘</th><th>距MA5</th><th>距MA20</th><th>距MA60</th><th>距MA120</th><th>距60日高点</th></tr></thead>
 <tbody>{rows_ma}</tbody></table></div>
 <p>{data["position_text"]}</p>
 <div class="note">均线距离为收盘价相对该均线的偏离百分比，正值为在均线上方。支撑位是技术参考位，不是预测。</div>
 
-<h2>六、破局判断：四条锚</h2>
+<h2>九、破局判断：四条锚</h2>
 <div class="anchors">{anchor_html}</div>
 <div class="verdict">
   <div class="l">当前档位</div>
@@ -1061,6 +1809,72 @@ def build_texts(data):
     else:
         st.append("非 AI 方向相对抗跌，跌幅主要集中在科技链，更像是板块间的资金再平衡，而不是全面撤退。")
     data["sector_text"] = "".join(st)
+
+    # 异动板块解读
+    flow_sec = data.get("flow_sectors") or {}
+    ast = []
+    if sectors:
+        top, bot = sectors[0], sectors[-1]
+        ast.append("板块层面，最强的是 <strong>%s（%s）</strong>，最弱的是 <strong>%s（%s）</strong>，"
+                   "两端相差 %.1f 个百分点。" % (top["name"], spct(top["pct"]),
+                                            bot["name"], spct(bot["pct"]),
+                                            (top["pct"] or 0) - (bot["pct"] or 0)))
+        up_n = len([s for s in sectors if s["pct"] > 0])
+        scope = "%d 个一级行业" % len(sectors)
+        ast.append("%s里 %d 个上涨、%d 个下跌。" % (scope, up_n, len(sectors) - up_n))
+        if flow_sec and top["name"] in flow_sec:
+            v = flow_sec[top["name"]]
+            ast.append(("但领涨的 %s 主力资金仍是净流出 %.0f 亿——"
+                        "这种「涨幅第一、资金净流出」的组合，说明它是<strong>跌得少</strong>，不是<strong>有人在买</strong>，"
+                        "在下跌途中往往只是避险资金的临时停留地，不具备领涨资格。"
+                        % (top["name"], abs(v) / 1e8))
+                       if v < 0 else
+                       ("领涨的 %s 主力净流入 %.0f 亿，涨幅和资金同向，是当天唯一有主动买盘的方向。"
+                        % (top["name"], v / 1e8)))
+        if flow_sec and bot["name"] in flow_sec:
+            v = flow_sec[bot["name"]]
+            if v < 0:
+                ast.append("领跌的 %s 主力净流出 %.0f 亿，是杀跌的主要出口。" % (bot["name"], abs(v) / 1e8))
+    data["anomaly_sec_text"] = "".join(ast)
+
+    # 异动个股解读
+    lp = data.get("pools") or {}
+    zt_n, dt_n, zb_n = lp.get("zt_n") or 0, lp.get("dt_n") or 0, lp.get("zb_n") or 0
+    zt_rows = lp.get("zt") or []
+    lhb = data.get("lhb") or []
+    pt = []
+    if zt_n or dt_n:
+        if dt_n > zt_n:
+            pt.append("跌停 <strong>%d</strong> 家多于涨停 <strong>%d</strong> 家，亏钱效应盖过赚钱效应。"
+                      % (dt_n, zt_n))
+        else:
+            pt.append("涨停 <strong>%d</strong> 家、跌停 <strong>%d</strong> 家，赚钱效应仍在。"
+                      % (zt_n, dt_n))
+        if zb_n:
+            rate = zb_n / (zt_n + zb_n) * 100
+            if rate >= 35:
+                pt.append("炸板 %d 家，炸板率 %.0f%%，承接力偏弱——盘中冲上去封不住，说明买盘是脉冲式的。"
+                          % (zb_n, rate))
+            else:
+                pt.append("炸板 %d 家，炸板率 %.0f%%，封住的居多。" % (zb_n, rate))
+        maxb = max([x["boards"] for x in zt_rows], default=0)
+        if maxb >= 3:
+            leaders = [x for x in zt_rows if x["boards"] == maxb]
+            pt.append("最高连板是 <strong>%s（%d 板）</strong>，这是当前的情绪高度；"
+                      "它能走多远，决定短线资金敢不敢跟。"
+                      % ("、".join(x["name"] for x in leaders[:3]), maxb))
+        elif zt_rows:
+            pt.append("最高只有 %d 板，没有龙头，短线资金处于无方向状态。" % maxb)
+    if lhb:
+        buy = [x for x in lhb if (x["net"] or 0) > 0]
+        sell = [x for x in lhb if (x["net"] or 0) < -1e7]   # 小于 0.1 亿的不值得单独点名
+        if buy:
+            pt.append("龙虎榜净买入第一是 <strong>%s（%+.2f 亿）</strong>。"
+                      % (buy[0]["name"], (buy[0]["net"] or 0) / 1e8))
+        if sell:
+            pt.append("榜内净卖出最多的是 %s（%+.2f 亿）。" % (sell[0]["name"], (sell[0]["net"] or 0) / 1e8))
+        pt.append("龙虎榜只反映当日最活跃的少数个股，是情绪的切片，不是选股清单。")
+    data["anomaly_stock_text"] = "".join(pt)
 
     # 传导链
     m = data["margin"]
@@ -1141,13 +1955,14 @@ def main():
 
     now = datetime.now(TZ)
     today = now.strftime("%Y-%m-%d")
-    print(f"[1/8] 时间基准 {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print(f"[1/10] 时间基准 {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
     # 指数
     idx = fetch_indices()
-    print(f"[2/8] 指数 {len(idx)} 个：{idx[0]['name']} {idx[0]['close']} {idx[0]['pct']}%")
+    print(f"[2/10] 指数 {len(idx)} 个：{idx[0]['name']} {idx[0]['close']} {idx[0]['pct']}%")
 
     # 交易日校验
+    print("[3/10] 校验交易日")
     sh_k = fetch_kline("1.000001", 140)
     if not sh_k:
         print("✗ 拿不到上证 K 线，退出")
@@ -1158,10 +1973,10 @@ def main():
         return 0
 
     # 涨跌家数：上证 / 深证综指 / 北证50 的成分统计，一次请求拿三市合计
-    fast = fetch_breadth_fast()
+    fast = fetch_breadth_fast(last_date.replace("-", ""))
     if fast:
         up, dn, flat = fast
-        breadth_src = "三市指数成分统计"
+        breadth_src = BREADTH_SOURCE
     else:
         print("✗ 拿不到涨跌家数，退出")
         return 2
@@ -1175,13 +1990,29 @@ def main():
     if not sectors:
         print("✗ 拿不到板块数据，退出")
         return 2
-    sector_src = "东财行业板块指数（板块内等权）"
-    print(f"[4/8] 板块 {len(sectors)} 个："
+    sector_src = SECTOR_SOURCE
+    print(f"[4/10] 板块 {len(sectors)} 个："
           f"{sectors[0]['name']} {sectors[0]['pct']}% … {sectors[-1]['name']} {sectors[-1]['pct']}%")
 
-    # 涨跌停
-    limits = fetch_limits(last_date.replace("-", ""))
-    print(f"[5/8] 涨停 {limits[0]} 跌停 {limits[1]}")
+    # 涨停 / 跌停 / 炸板池 —— 顺便把涨跌停家数也带出来，省两次请求
+    dstr = last_date.replace("-", "")
+    pools = fetch_limit_pools(dstr)
+    limits = (pools["zt_n"] or None, pools["dt_n"] or None)
+    print(f"[5/10] 涨停 {pools['zt_n']} 跌停 {pools['dt_n']} 炸板 {pools['zb_n']}")
+
+    # 龙虎榜
+    lhb = fetch_lhb(last_date)
+    print(f"      龙虎榜 {len(lhb)} 只")
+
+    # 资金流向：大盘五档 + 行业主力净额
+    flow = fetch_flow()
+    flow_sectors, flow_src = fetch_sector_flow(sectors)
+    if flow:
+        print(f"[6/10] 主力 {flow['main']/1e8:+.1f} 亿"
+              f"（沪 {flow['sh']['main']/1e8:+.1f} / 深 {flow['sz']['main']/1e8:+.1f}）"
+              f"，行业资金 {len(flow_sectors)} 个")
+    else:
+        print("[6/10] ! 资金流拿不到，该节留空")
 
     # 两融
     margin = fetch_margin(60)
@@ -1190,7 +2021,7 @@ def main():
         return 2
     margin_delta = margin[-1]["total"] - margin[-2]["total"]
     margin_cum = margin[-1]["total"] - margin[0]["total"]
-    print(f"[6/8] 两融 {margin[-1]['total']/1e4:.4f} 万亿，单日 {margin_delta:+.1f} 亿")
+    print(f"[7/10] 两融 {margin[-1]['total']/1e4:.4f} 万亿，单日 {margin_delta:+.1f} 亿")
 
     # 海外
     overseas = fetch_overseas()
@@ -1228,6 +2059,11 @@ def main():
         "sector_src": sector_src,
         "breadth_src": breadth_src,
         "two_mkt_prev": two_mkt_prev,
+        "flow": flow or {},
+        "flow_sectors": flow_sectors,
+        "flow_src": flow_src,
+        "pools": pools,
+        "lhb": lhb,
         "date_cn": now.strftime("%Y年%-m月%-d日") if os.name != "nt" else now.strftime("%Y年%m月%d日"),
         "gen_at": now.strftime("%H:%M"),
     }
@@ -1247,7 +2083,7 @@ def main():
     data["grade"], data["hit"] = grade, hit
 
     data = build_texts(data)
-    print(f"[7/8] 定性：{headline}｜档位：{grade}（{hit}/4 到位）")
+    print(f"[8/10] 定性：{headline}｜档位：{grade}（{hit}/4 到位）")
 
     out = args.out
     os.makedirs(os.path.join(out, "archive"), exist_ok=True)
@@ -1261,7 +2097,12 @@ def main():
         except Exception:  # noqa: BLE001
             issues = []
     summary = (f'上证 {spct(idx[0]["pct"])}，创业板 {spct(idx[2]["pct"])}，'
-               f'中证1000 {spct(idx[4]["pct"])}，跌停 {limits[1] if limits[1] is not None else "—"} 家')
+               f'中证1000 {spct(idx[4]["pct"])}')
+    if flow:
+        summary += f'，主力 {flow["main"]/1e8:+.0f} 亿'
+    summary += '，涨停 %s / 跌停 %s 家' % (
+        limits[0] if limits[0] is not None else "—",
+        limits[1] if limits[1] is not None else "—")
     issues = [x for x in issues if x.get("date") != today]
     issues.append({"date": today, "title": headline, "summary": summary,
                    "path": f"archive/{today}.html"})
@@ -1269,6 +2110,7 @@ def main():
     issues = issues[:120]
     data["past"] = issues
 
+    print("[9/10] 渲染页面")
     html = render(data)
     with open(os.path.join(out, "index.html"), "w", encoding="utf-8") as f:
         f.write(html)
@@ -1278,7 +2120,7 @@ def main():
     with open(issues_path, "w", encoding="utf-8") as f:
         json.dump(issues, f, ensure_ascii=False, indent=1)
 
-    print(f"[8/8] 已写入 {out}/index.html、{out}/archive/{today}.html、issues.json（往期 {len(issues)} 期）")
+    print(f"[10/10] 已写入 {out}/index.html、{out}/archive/{today}.html、issues.json（往期 {len(issues)} 期）")
     return 0
 
 

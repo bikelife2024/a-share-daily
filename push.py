@@ -69,9 +69,10 @@ def main():
         title = title[:32]
 
     lines = ["## %s" % head, "", "**%s**" % summary, ""]
-    link = base + (row.get("path") or "")
+    # 推文里指首页（最新一期，带往期下拉框），不指存档页
+    link = base or ""
     if base:
-        lines.append("[点这里看完整复盘（含图表与持仓）](%s)" % link)
+        lines.append("[点这里看完整复盘（含图表、资金流向、异动明细）](%s)" % link)
         lines.append("")
         lines.append("> %s" % base)
     else:
