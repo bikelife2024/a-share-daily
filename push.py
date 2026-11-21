@@ -20,6 +20,7 @@ import os
 import sys
 import urllib.parse
 import urllib.request
+from datetime import datetime
 
 UA = "Mozilla/5.0 (compatible; a-share-daily/1.0)"
 
@@ -111,6 +112,13 @@ def main():
         return 0
 
     date = row.get("date", "")
+
+    # 休市日（以及被 gen_report 跳过的重复运行）不推旧内容，免得周末收到上一条
+    today = datetime.now().strftime("%Y-%m-%d")
+    if date != today and os.environ.get("FORCE_PUSH", "").strip() not in ("1", "true", "True"):
+        print("· 最新一期是 %s，不是今天（%s），跳过推送。要强制推，设 FORCE_PUSH=1" % (date, today))
+        return 0
+
     head = row.get("title", "")
     short = date[5:].replace("-", "月") + "日"
 
