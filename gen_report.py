@@ -1219,7 +1219,7 @@ JS = """
 (function(){
   var bar=document.getElementById('pastBar'),sel=document.getElementById('pastSelect'),meta=document.getElementById('pastMeta');
   if(!bar||!sel||!window.PAST||!window.PAST.length) return;
-  var base=/\/archive\//.test(location.pathname)?'../':'';
+  var base=location.pathname.indexOf('/archive/')>=0?'../':'';
   var rows=window.PAST.slice().sort(function(a,b){return String(b.date).localeCompare(String(a.date))});
   function label(d){
     var w=['周日','周一','周二','周三','周四','周五','周六'],s=String(d||'');
@@ -1239,7 +1239,9 @@ JS = """
   });
   var r=hit(); if(meta) meta.textContent=r?(r.summary||''):'';
   sel.addEventListener('change',function(){
-    var t=hit(); if(t) location.href=base+t.path;
+    var t=hit(); if(!t) return;
+    // path 可能是相对路径（GitHub Pages 的 archive/），也可能是完整 URL（活页那版指向 Pages 的存档）
+    location.href=/^https?:/i.test(t.path)?t.path:base+t.path;
   });
   bar.hidden=false;
 })();
@@ -2119,6 +2121,17 @@ def main():
 
     with open(issues_path, "w", encoding="utf-8") as f:
         json.dump(issues, f, ensure_ascii=False, indent=1)
+
+    # 活页那版：往期下拉要指向 GitHub Pages 的存档页。
+    # 活页上没有 archive/ 目录，相对路径会被解析到站点根，点了一律 404；
+    # 所以多渲染一份把 path 换成绝对地址。render 是纯函数，不重复打接口。
+    abs_base = os.environ.get("PAST_ABS_BASE", "").rstrip("/")
+    if abs_base:
+        data_lp = dict(data)
+        data_lp["past"] = [dict(x, path=abs_base + "/" + x["path"]) for x in issues]
+        with open(os.path.join(out, "livepage.html"), "w", encoding="utf-8") as f:
+            f.write(render(data_lp))
+        print(f"      （活页版已生成 {out}/livepage.html，往期指向 {abs_base}）")
 
     print(f"[10/10] 已写入 {out}/index.html、{out}/archive/{today}.html、issues.json（往期 {len(issues)} 期）")
     return 0
